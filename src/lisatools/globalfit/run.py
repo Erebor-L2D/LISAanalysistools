@@ -567,6 +567,7 @@ class GlobalFit:
             self.logger.debug("acs setup done")
 
             state.log_like[:] = acs.likelihood(complex=False)
+            logger.info(f"initial log likelihood: {state.log_like[0]}")
 
             like_mix = BasicResidualacsLikelihood(acs)
 
@@ -680,14 +681,18 @@ class GlobalFit:
             # permute False is there for the PSD sampling for now
 
             truths = self.curr.get_truths_dict()
-            _ = truths.pop("gb", None)
+
+            exclude_from_plot = ["gb"]  # TODO: make this more general
+            truths_plot = {key: val for key, val in truths.items() if key not in exclude_from_plot}
+            branches_plot = [name for name in branch_names if name not in exclude_from_plot]
 
             plot_container = PlotContainer(
                 plots=["base", "tempering"],
+                branches=branches_plot,
                 parent_folder=self.curr.general_info.artifacts_file_dir + "diagnostics/",
                 tempering_palette="icefire",
-                discard=0.4,
-                truths=truths,
+                discard=0.3,
+                truths=truths_plot,
             )
 
             sampler_mix = GlobalFitEngine(
@@ -730,20 +735,16 @@ class GlobalFit:
             )  # sampler_mix.compute_log_prior(state.branches_coords, inds=state.branches_inds, supps=supps)
             self.recipe.setup_first_recipe_step(sampler_mix.iteration, state, sampler_mix)
 
-            gf_plotter = GlobalFitPlotter(curr=self.curr)
-            gf_plotter.save_input_data()
-
-            meta = RunMetadata.from_curr(self.curr)
-
-            save_residuals(acs, meta.input_data_link, is_residuals=False)
-            logger.info("Input data saved.")
+            if self.curr.general_info.submission_parent_folder is not None:
+                gf_plotter = GlobalFitPlotter(curr=self.curr)
+                gf_plotter.save_input_data()
 
             sampler_mix.run_mcmc(state, self.curr.general_info.num_iterations, thin_by=1, progress=True, store=True)
 
-            submission_writer = SubmissionWriter(backend=backend, curr=self.curr, ess=20_000)
-            submission_writer.write_submission()
-
-            save_residuals(acs, os.path.join(meta.submission_folder, "residuals.h5"), is_residuals=True)
+            if self.curr.general_info.submission_parent_folder is not None:
+                self.logger.debug(f"saving submission to {self.curr.general_info.submission_parent_folder}")
+                submission_writer = SubmissionWriter(backend=backend, curr=self.curr, ess=20_000)
+                submission_writer.write_submission(acs)
 
             logger.info("Residuals saved.")
 

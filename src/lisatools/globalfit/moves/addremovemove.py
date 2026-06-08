@@ -5,6 +5,8 @@ import time
 from copy import deepcopy
 from typing import Any, Callable, TYPE_CHECKING
 
+from lisatools.datacontainer import DataResidualArray
+
 
 try:
     import cupy as xp
@@ -24,16 +26,12 @@ from .globalfitmove import GlobalFitMove
 from .multigpumove import MultiGPUMoveBase
 
 logger = logging.getLogger(__name__)
+DEBUG_MODE = False
 
 if TYPE_CHECKING:
     from ...sources.waveformbase import TDWaveformBase
     from ...domaincomputation import DomainComputationGroupArray
-
-def free_gpu_memory():
-    if xp is not np:
-        xp.get_default_memory_pool().free_all_blocks()
     
-
 class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
     """
     Move that handles adding and removing sources to and from the residuals stored in the analysis container array.
@@ -55,6 +53,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         Tmax: maximum temperature for the temperature control.
         betas_all: array of betas for all leaves and temperatures. Shape is (nleaves_max, ntemps). If None, betas will be initialized as in TemperatureControl.
         permute_every: number of repeats after which to permute the walkers during a temperature swap. This helps with the mixing of the chains.
+        pad_out_of_prior: whether to pad proposed sources that are out of the prior bounds to avoid JIT compilation issues. If True, proposed sources that are out of the prior bounds will be replaced with the first in-prior point. 
         **kwargs: additional keyword arguments for the Move class.
     """
 
@@ -73,6 +72,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         Tmax: float = np.inf,
         betas_all: np.ndarray = None,
         permute_every: int = 20,
+        pad_out_of_prior: bool = False,
         **kwargs,
     ):
 
@@ -113,6 +113,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             )
         
         self.permute_every = permute_every
+        self.pad_out_of_prior = pad_out_of_prior
         
         # make sure to propagate the periodic information to the inner moves if it is included in kwargs
         if 'periodic' in kwargs:
@@ -129,6 +130,10 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             for tmp_move in self.moves:
                 if tmp_move.periodic is None:
                     tmp_move.periodic = periodic
+
+    def free_gpu_memory(self):
+        if self.xp is not np:
+            self.xp.get_default_memory_pool().free_all_blocks()
 
     def check_add_skip_swap_info(self, state):
 
@@ -160,15 +165,11 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         # )  #  - xp.sum(xp.log(xp.asarray(psd[:2])), axis=(0, 2))).get()
         self.acs.remove_signal_from_residual(removal_waveforms, data_index=None)
 
-        # sync everything before freeing memory
-        if xp is not np:
-            for gpu in self.acs.gpus:
-                xp.cuda.runtime.setDevice(gpu)
-                xp.cuda.runtime.deviceSynchronize()                                                                                                                                                                                                                                                      
+        self.acs.synchronize()                                                                                                                                                                                                                                              
                 
         del removal_waveforms
         #if xp is not np:
-        free_gpu_memory()
+        self.free_gpu_memory()
 
     def remove_cold_chain_sources(self, coords):
         """
@@ -187,14 +188,11 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         # )  #  - xp.sum(xp.log(xp.asarray(psd[:2])), axis=(0, 2))).get()
         self.acs.add_signal_to_residual(removal_waveforms, data_index=None)
         
-        if xp is not np:
-            for gpu in self.acs.gpus:
-                xp.cuda.runtime.setDevice(gpu)
-                xp.cuda.runtime.deviceSynchronize()  
+        self.acs.synchronize()
 
         del removal_waveforms
         #if xp is not np:
-        free_gpu_memory()
+        self.free_gpu_memory()
 
         # ll_tmp3 = self.acs.likelihood(
         #     source_only=True
@@ -218,7 +216,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
         """
         #if xp is not np:
-        free_gpu_memory()
+        self.free_gpu_memory()
 
         waveforms = []
         for i in range(coords.shape[0]):
@@ -228,6 +226,42 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
     def setup_likelihood_here(self, coords):
         pass
+
+    def compute_acs_like(self, coords_in, data_index, signal_gen, **kwargs):
+        """
+        Compute the likelihood for the given coordinates and data index using the analysis container array.
+
+        Args:
+            coords_in: coordinates of the sources for which we want to compute the likelihood. Shape is (n_sources, ndim).
+            data_index: index of the data for which we want to compute the likelihood. Shape is (n_sources,).
+            signal_gen: waveform generator function to use for computing the likelihood. This is needed because in some cases we need to compute the likelihood with a different waveform generator than the one used for proposing new sources, for example when using heterodyned likelihoods.
+            kwargs: additional keyword arguments for the likelihood computation function.
+
+        Returns:
+            ll: likelihood for the given coordinates and data index. Shape is (n_sources,).
+        """
+        # TODO: we should probably move the prior in here even though
+        # in general with current setup it should only be points in the prior
+        # that make it here
+        ll = np.full_like(data_index, -1e300, dtype=float)
+        #data_index = xp.asarray(data_index.astype(np.int32)) # make sure data index is on the same device as the likelihood computation
+        source_only = kwargs.pop("source_only", False)
+        all_templates = signal_gen(*coords_in.T, **self.waveform_gen_kwargs)
+        for i in range(coords_in.shape[0]):
+            ll[i] = self.acs[data_index[i]].template_likelihood(
+                DataResidualArray(all_templates[i]),
+                include_psd_info=not source_only,
+                **kwargs,
+            )
+        # for i, (coords_in_now, data_index_now) in enumerate(zip(coords_in, data_index)):
+        #     ll[i] = self.acs[data_index_now].calculate_signal_likelihood(
+        #         *coords_in_now,
+        #         waveform_kwargs=self.waveform_gen_kwargs,
+        #         signal_gen=signal_gen,
+        #         **kwargs,
+        #     )
+
+        return ll
 
     def compute_like(self, coords_in, data_index):
         """
@@ -240,20 +274,8 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         Returns:
             ll: likelihood for the given coordinates and data index. Shape is (n_sources,).
         """
-        # TODO: we should probably move the prior in here even though
-        # in general with current setup it should only be points in the prior
-        # that make it here
-        ll = np.full_like(data_index, -1e300, dtype=float)
-        #data_index = xp.asarray(data_index.astype(np.int32)) # make sure data index is on the same device as the likelihood computation
-        for i, (coords_in_now, data_index_now) in enumerate(zip(coords_in, data_index)):
-            ll[i] = self.acs[data_index_now].calculate_signal_likelihood(
-                *coords_in_now,
-                waveform_kwargs=self.waveform_gen_kwargs,
-                signal_gen=self.waveform_gen,
-                **self.waveform_like_kwargs,
-            )
+        return self.compute_acs_like(coords_in, data_index, signal_gen=self.waveform_gen, **self.waveform_like_kwargs)
 
-        return ll
 
     def setup(self, model, state):
         return
@@ -292,6 +314,14 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             .real
         )
         return output, None  # AS: match psd? I'm not sure
+
+    def get_split_inds(self):
+        all_inds = np.tile(np.arange(self.nwalkers), (self.ntemps, 1))
+        inds = all_inds % self.nsplits
+        if self.randomize_split:
+            [np.random.shuffle(x) for x in inds]
+
+        return inds
 
     def propose(self, model, state):
 
@@ -366,8 +396,25 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                 .real
             )
 
-            if np.any(prev_logl < -1e11):
-                logger.warning(f"Very low log likelihood encountered in propose: {prev_logl.min()}. This could be a sign of numerical issues.")
+            # if hasattr(self, "waveform_gen_method"):
+            #     signal_gen = getattr(self.waveform_gen, self.waveform_gen_method)
+            # else:
+            #     signal_gen = self.waveform_gen
+            
+            # acs_like_here = self.compute_acs_like(old_coords_in, data_index=data_index_in, signal_gen=signal_gen, source_only=True).reshape((self.ntemps, self.nwalkers)).real
+            # diff = prev_logl - acs_like_here
+
+            # if np.any(np.abs(diff) > 1e-1):
+            #         logger.warning(f"acs likelihood: {acs_like_here.flatten()}. proposed likelihood: {prev_logl.flatten()}. This could be a sign of numerical issues.")
+            #         if DEBUG_MODE:
+            #             breakpoint()
+            #         else:
+            #             raise ValueError(f"Large difference in log likelihood encountered: {np.abs(diff).max()}. This could be a sign of numerical issues.")
+
+            if np.any(prev_logl < -1e10) or np.any(prev_logl > 1e30):
+                logger.warning(f"Very low log likelihood encountered in propose: min = {prev_logl.min()}, max = {prev_logl.max()}. This could be a sign of numerical issues.")
+                if DEBUG_MODE:
+                    breakpoint()
 
             prev_logp = (
                 self.priors[self.branch_name]
@@ -380,7 +427,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             )
 
             # fix this need to compute prev_logl for all walkers
-            free_gpu_memory()
+            self.free_gpu_memory()
             for repeat in tqdm(range(self.num_repeats), desc=f"{self.branch_name} update, leaf {leaf}"):
 
                 # pick move
@@ -392,10 +439,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
                 # Split the ensemble in half and iterate over these two halves.
                 accepted = np.zeros((ntemps_full, self.nwalkers), dtype=bool)
-                all_inds = np.tile(np.arange(self.nwalkers), (self.ntemps, 1))
-                inds = all_inds % self.nsplits
-                if self.randomize_split:
-                    [np.random.shuffle(x) for x in inds]
+                inds = self.get_split_inds()
 
                 # prepare accepted fraction
                 # accepted_here = np.zeros((self.ntemps, self.nwalkers), dtype=bool)
@@ -435,25 +479,40 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                     # Compute prior of the proposed position
                     # new_inds_prior is adjusted if product-space is used
                     logp = self.priors[self.branch_name].logpdf(new_points.reshape(-1, ndim))
-
-                    new_points_in = self.transform_fn.both_transforms(
-                        new_points.reshape(-1, ndim)[~np.isinf(logp)]
-                    )
-
-                    # Compute the lnprobs of the proposed position.
-                    data_index = np.asarray(walker_inds_here[~np.isinf(logp)].astype(np.int32))
-                    # noise_index = walker_inds_here[~np.isinf(logp)].astype(np.int32)
-
-                    # self.waveform_gen.d_d = xp.asarray(d_d_store[(temp_inds_here[~np.isinf(logp)], walker_inds_here[~np.isinf(logp)])])
-
+                    in_prior = ~np.isinf(logp)
                     logl = np.full_like(logp, -1e300)
 
-                    # logl[~np.isinf(logp)] = self.waveform_gen.get_direct_ll(fd, data_residuals.flatten(), psd.flatten(), self.df, *new_points_in.T, noise_index=noise_index, data_index=data_index, **self.waveform_kwargs).real.get()
-                    logl[~np.isinf(logp)] = self.compute_like(
-                        new_points_in,
-                        data_index=data_index,
-                        # constants_index=data_index,
-                    )
+                    if np.any(in_prior):
+                        if self.pad_out_of_prior and np.any(~in_prior):
+                            padded = new_points.reshape(-1, ndim).copy()
+                            padded[~in_prior] = new_points.reshape(-1, ndim)[in_prior][0]
+                            new_points_in = self.transform_fn.both_transforms(padded)
+
+                            data_index = np.asarray(walker_inds_here.astype(np.int32))
+
+                            all_logl = self.compute_like(new_points_in, data_index=data_index)
+                            logl = np.where(in_prior, all_logl, -1e300)
+
+                        else:
+                            new_points_in = self.transform_fn.both_transforms(
+                                new_points.reshape(-1, ndim)[in_prior]
+                            )
+
+                            # Compute the lnprobs of the proposed position.
+                            data_index = np.asarray(walker_inds_here[in_prior].astype(np.int32))
+                
+                            logl[in_prior] = self.compute_like(
+                                    new_points_in,
+                                    data_index=data_index,
+                                )
+                    
+                    if DEBUG_MODE:
+                        logger.debug(f"average proposed logl: {logl[in_prior].mean()}.")
+    
+                    if np.any(logl[in_prior] < -1e10) or np.any(logl[in_prior] > 1e30):
+                        logger.warning(f"Suspicious likelihood encountered in propose: min = {logl[~np.isinf(logp)].min()}, max = {logl[~np.isinf(logp)].max()}. This could be a sign of numerical issues.")
+                        if DEBUG_MODE:
+                            breakpoint()
                     # print(f"new logl: {logl}. elapsed: {time.time() - tic}")
 
                     logl = logl.reshape(self.ntemps, nwalkers_here)
@@ -539,7 +598,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             # ll_tmp1 = -1/2 * 4 * self.df * xp.sum(data_residuals[:2].conj() * data_residuals[:2] / psd[:2], axis=(0, 2)).get()
 
             # add back cold chain sources
-            free_gpu_memory()
+            self.free_gpu_memory()
 
             add_coords = new_state.branches[self.branch_name].coords[0, :, leaf]
             add_coords_in = self.transform_fn.both_transforms(add_coords)
@@ -561,11 +620,14 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             self.acs.likelihood()
         )  #  - xp.sum(xp.log(xp.asarray(psd[:2])), axis=(0, 2))).get()
         # print("after computing current likelihood. elapsed: ", time.time() - tic)
-        free_gpu_memory()
-        if np.any(current_ll < -1e9):
-            # keep a safe guard here
-            logger.warning(f"Very low log likelihood encountered after propose: {current_ll.min()}. This could be a sign of numerical issues.")
-            #breakpoint()
+        if np.any(current_ll < 0.0):
+            logger.warning(f"The ACS likelihood should always be positive given the psd contribution, but got {current_ll.min()}")
+            logger.warning(f"The minimum proposed likelihood was {prev_logl.min()}.")
+            if DEBUG_MODE:
+                breakpoint()
+            # else:
+            #     raise ValueError(f"The ACS likelihood should always be positive given the psd contribution, but got {current_ll.min()}")
+
         # TODO: add check with last used logl
 
         current_lp = (
@@ -577,7 +639,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
         new_state.log_like[0] = current_ll
         # new_state.log_prior[0] = current_lp
-        free_gpu_memory()
+        self.free_gpu_memory()
         if not hasattr(self, "best_last_ll"):
             self.best_last_ll = current_ll.max()
             self.low_last_ll = current_ll.min()
@@ -595,8 +657,10 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         # new_state.log_prior[:] = model.compute_log_prior_fn(new_state.branches_coords, inds=new_state.branches_inds, supps=new_state.supplimental)
         # breakpoint()
         new_state.log_like[:] = (
-            self.acs.likelihood()
+            current_ll #self.acs.likelihood()
         )  #  - xp.sum(xp.log(xp.asarray(psd[:2])), axis=(0, 2))).get()
+
+        self.free_gpu_memory()
 
         # assert np.abs(new_state.log_like[0] - self.acs.get_ll(include_psd_info=True)).max() < 1e-4
         # breakpoint()
@@ -633,7 +697,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                 new_contrib[1] += add_waveforms[1]
 
         self.acs.swap_out_in_base_data(old_contrib, new_contrib)
-        free_gpu_memory()
+        self.free_gpu_memory()
 
 class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBase):
     """
@@ -654,6 +718,7 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
     Tmax: maximum temperature for the temperature control.
     betas_all: array of betas for all leaves and temperatures. Shape is (nleaves_max, ntemps). If None, betas will be initialized as in TemperatureControl.
     permute_every: number of repeats after which to permute the walkers during a temperature swap. 
+    pad_out_of_prior: whether to pad proposed sources that are out of the prior bounds to avoid JIT compilation issues. If True, proposed sources that are out of the prior bounds will be replaced with the first in-prior point. 
     run_async: whether to run the waveform generation and likelihood computation asynchronously for each GPU. If True, the synchronization will happen on the python side after the kernel calls. 
     run_threaded: whether to run the waveform generation and likelihood computation in separate threads for each GPU.
     waveform_like_method: name of the method of the waveform generator class to use for generating the waveforms for likelihood computation. If None, will use the same method as waveform_gen_method.
@@ -674,6 +739,7 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
         Tmax: float = np.inf,
         betas_all: np.ndarray = None,
         permute_every: int = 20,
+        pad_out_of_prior: bool = False,
         run_async: bool = False,
         run_threaded: bool = False,
         waveform_like_method: str = None,
@@ -694,6 +760,7 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
             Tmax=Tmax,
             betas_all=betas_all,
             permute_every=permute_every,
+            pad_out_of_prior=pad_out_of_prior,
             **kwargs
         )
 
@@ -718,6 +785,10 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
                 raise ValueError("Waveform generator must have a 'kwargs' attribute that contains the keyword arguments to initialize the waveform generator.")    
             
             with self.dcga.device_context(device):
+                # if i == 0:
+                #     # Reuse the initial waveform generator for the first split to save memory
+                #     self._waveform_generators.append(self.waveform_gen)
+                # else:
                 init_kwargs = self.waveform_gen.kwargs.copy()
                 if "orbits" in init_kwargs:
                     init_kwargs["orbits"] = self.dcga.computation_groups[i].orbits
@@ -725,6 +796,9 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
                 self._waveform_generators.append(
                     self.waveform_gen.__class__(**init_kwargs)
                 )
+
+    def free_gpu_memory(self):
+        self.dcga.free_gpu_memory()
 
     @property
     def waveform_generators(self) -> list:
@@ -769,7 +843,7 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
         """Get the waveforms for the given source coordinates.
 
         """
-        free_gpu_memory()
+        self.free_gpu_memory()
 
         data_index = np.arange(coords.shape[0], dtype=np.int32)
 
@@ -832,12 +906,20 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
             run_threaded=self.run_threaded,
         )
 
-        # Release waveform GPU arrays (signal_out) held by likelihood_args_per_split.
-        # synchronize() inside compute_signal_likelihood cannot free them because this
-        # local variable is still alive at that point.
-        del likelihood_args_per_split
-        free_gpu_memory()
+        # Release GPU arrays before freeing the pool.
+        # waveform_args_per_split / data_intra_index_per_split are small coord arrays
+        # from place_on_device/make_args_tuple; likelihood_args_per_split holds the
+        # large template arrays.  All must be dereferenced before free_all_blocks() so
+        # those blocks are actually returned to CUDA rather than staying "owned" in the pool.
+        del likelihood_args_per_split, waveform_args_per_split, data_intra_index_per_split
+        
+        self.free_gpu_memory()
+
+        if np.any(~np.isfinite(likelihoods)):
+                logger.warning(f"Non-finite likelihoods encountered: {likelihoods}. This could be a sign of numerical issues.")
+                if DEBUG_MODE:
+                    breakpoint()
 
         likelihoods = np.where(np.isfinite(likelihoods), likelihoods, -1e300)
-        return likelihoods
 
+        return likelihoods

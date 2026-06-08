@@ -27,12 +27,14 @@ from eryn.utils import get_integrated_act
 from scipy.interpolate import CubicSpline
 from tqdm import tqdm
 
+from ..analysiscontainer import AnalysisContainerArray
+from ..datacontainer import DataResidualArray
 from ..domains import FDSettings, STFTSettings, TDSettings
 from ..utils.utility import windowfun
+from .gathergalaxy import gather_gb_samples
 
 if TYPE_CHECKING:
     from eryn.utils.transform import TransformContainer
-    from ..analysiscontainer import AnalysisContainerArray, AnalysisContainer
     from ..detector import Orbits
     from ..domains import DomainSettingsBase, TDSettings
     from ..sensitivity import XYZSensitivityBackend
@@ -64,12 +66,12 @@ _GB_PARAM_INFO: Dict[str, ParameterInfo] = {
 }
 
 _MBH_PARAM_INFO: Dict[str, ParameterInfo] = {
-    "m1": ParameterInfo("mass1", r"$m_1\,[M_\odot]$", "solMass"),
-    "m2": ParameterInfo("mass2", r"$m_2\,[M_\odot]$", "solMass"),
+    "m1": ParameterInfo("primary_mass_det_frame", r"$m_1\,[M_\odot]$", "solMass"),
+    "m2": ParameterInfo("secondary_mass_det_frame", r"$m_2\,[M_\odot]$", "solMass"),
     "s1z": ParameterInfo("spin1", r"$s_{1z}$", "dimensionless"),
     "s2z": ParameterInfo("spin2", r"$s_{2z}$", "dimensionless"),
     "distance": ParameterInfo("luminosity_distance", r"$d_L\,[\mathrm{Gpc}]$", "Gpc"),
-    "phi_ref": ParameterInfo("reference_phase", r"$\phi_{\mathrm{ref}}\,[\mathrm{rad}]$", "rad"),
+    "phi_ref": ParameterInfo("phase_at_reference_time", r"$\phi_{\mathrm{ref}}\,[\mathrm{rad}]$", "rad"),
     "iota": ParameterInfo("inclination", r"$\iota\,[\mathrm{rad}]$", "rad"),
     "psi": ParameterInfo("polarization", r"$\psi\,[\mathrm{rad}]$", "rad"),
     "ra": ParameterInfo("right_ascension", r"$\alpha\,[\mathrm{rad}]$", "rad"),
@@ -106,12 +108,14 @@ PARAMETER_INFO_REGISTRY: Dict[str, Dict[str, ParameterInfo]] = {
     # add entries for other source types as needed
 }
 
+_STOCHASTIC_BRANCHES = ["psd", "galfor"]
+
 # Corrections applied after TransformContainer to fix waveform-gen vs L3C unit mismatches.
 # The MBH transform applies gpc_to_mpc (Gpc→Mpc) for the waveform generator;
 # L3C requires distance in Gpc, so we invert here.
 _OUTPUT_CORRECTIONS_REGISTRY: Dict[str, Dict[str, Callable]] = {
     "gb": {},
-    "mbh": {"distance": lambda x: x * 1e-3},
+    "mbh": {"luminosity_distance": lambda x: x * 1e-3},
     "psd": {},
     "galfor": {},
 }
@@ -129,8 +133,155 @@ source_types_names = dict(
     emri="EMRI",
     sobh="SOBHB",
     psd="NOISE",
-    galfor="STOCHASTIC",  # todo: should we merge noise and stochastic together under a common "stochastic" source type?
+    galfor="NOISE",  # todo: should we merge noise and stochastic together under a common "stochastic" source type?
 )
+
+# order of the mojito light mbh sources, sorted by merger time (earliest to latest), for the purpose of assigning `known_injection` labels in the metadata
+_MOJITO_LIGHT_MBH_ORDER = ["source_18", "source_5", "source_16", "source_7", "source_2", "source_12", "source_9", "source_4", "source_0", "source_15", "source_3", "source_10", "source_19", "source_13", "source_6", "source_17", "source_8", "source_1", "source_11", "source_14"] 
+
+MAX_SOURCES_PER_BATCH = 500
+
+def _apply_output_corrections(branch: str, samples_dict: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Apply branch-specific output corrections to a posterior mapping."""
+
+    corrected = dict(samples_dict)
+    transform = _OUTPUT_CORRECTIONS_REGISTRY[branch]
+
+    for key, func in transform.items():
+        if key in corrected:
+            corrected[key] = func(corrected[key])
+            logger.info(
+                f"Applied output correction for parameter '{key}' in branch '{branch}'"
+            )
+
+    return corrected
+
+
+def _filter_removed_params(branch: str, samples_dict: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Remove parameters that should not be written for the given branch."""
+
+    removed_params = set(_REMOVED_PARAMS_REGISTRY[branch])
+    filtered = {}
+
+    for name, values in samples_dict.items():
+        if name in removed_params:
+            logger.info(
+                f"Parameter '{name}' is marked for removal in branch '{branch}'. Skipping this parameter in the output."
+            )
+            continue
+        filtered[name] = values
+
+    return filtered
+
+
+def posteriors_to_structured_array(samples_dict: dict[str, np.ndarray]) -> np.ndarray:
+    """Convert a posterior mapping into a structured NumPy array."""
+
+    if not samples_dict:
+        raise ValueError("Cannot build a structured array from an empty posterior mapping.")
+
+    param_names = list(samples_dict.keys())
+    param_data = [samples_dict[name] for name in param_names]
+    dtype = [(name, "f8") for name in param_names]
+    structured_array = np.zeros(len(param_data[0]), dtype=dtype)
+
+    for name, data in zip(param_names, param_data):
+        structured_array[name] = data
+
+    return structured_array
+
+
+def detections_to_structured_array(detections: list[dict]) -> np.ndarray:
+    """Convert detection records into a structured NumPy array for HDF5 storage."""
+
+    str_dtype = h5py.string_dtype(encoding="utf-8")
+    fields = [
+        ("source_id", str_dtype),
+        ("posterior_id", str_dtype),
+        ("comment", str_dtype),
+        ("quality_flag", "i8"),
+        ("known_injection", str_dtype),
+        ("detection_statistic", "f8"),
+    ]
+    structured_array = np.zeros(len(detections), dtype=fields)
+
+    for i, detection in enumerate(detections):
+        for name, field_dtype in fields:
+            value = detection[name]
+            structured_array[name][i] = str(value) if field_dtype is str_dtype else value
+
+    return structured_array
+
+
+def _save_metadata_attributes(h5obj: h5py.File | h5py.Group, metadata: MetadataBase) -> None:
+    """Save dataclass metadata fields as HDF5 attributes."""
+
+    for field in dataclasses.fields(metadata):
+        value = getattr(metadata, field.name)
+        if isinstance(value, (str, int, float)):
+            h5obj.attrs[field.name] = value
+        elif isinstance(value, list):
+            h5obj.attrs[field.name] = json.dumps(value)
+        elif isinstance(value, dict):
+            h5obj.attrs[field.name] = json.dumps(value)
+        else:
+            logger.warning(
+                f"Unsupported metadata field type for '{field.name}': {type(value)}. Skipping this field."
+            )
+
+
+def _save_posterior_dataset(
+    h5obj: h5py.File | h5py.Group,
+    source_label: str,
+    samples_dict: dict[str, np.ndarray],
+) -> None:
+    """Write one posterior dataset into an open HDF5 object."""
+
+    h5obj.create_dataset(source_label, data=posteriors_to_structured_array(samples_dict))
+
+
+def _build_leaf_samples_dict(
+    samples_here: np.ndarray,
+    parameter_names: list[str],
+    leaf: int,
+    branch: str,
+    log_prior: np.ndarray,
+    log_likelihood: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Build one leaf's posterior mapping and apply corrections/filtering."""
+
+    samples_dict = {name: samples_here[..., i] for i, name in enumerate(parameter_names)}
+    samples_dict["logprior"] = log_prior
+    samples_dict["loglikelihood"] = log_likelihood
+    samples_dict = _apply_output_corrections(branch, samples_dict)
+    samples_dict = _filter_removed_params(branch, samples_dict)
+
+    return {
+        name: values[:, leaf] if len(values.shape) == 2 else values
+        for name, values in samples_dict.items()
+    }
+
+
+def _build_stochastic_samples_dict(
+    samples: np.ndarray,
+    parameter_names: list[str],
+    branches_here: list[str],
+    log_prior: np.ndarray,
+    log_likelihood: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Build the combined posterior mapping for stochastic branches."""
+
+    samples_dict = {name: samples[:, 0, i] for i, name in enumerate(parameter_names)}
+    samples_dict["logprior"] = log_prior
+    samples_dict["loglikelihood"] = log_likelihood
+
+    combined: dict[str, np.ndarray] = {}
+    for branch in branches_here:
+        branch_samples = _apply_output_corrections(branch, samples_dict)
+        branch_samples = _filter_removed_params(branch, branch_samples)
+        combined.update(branch_samples)
+
+    return combined
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -454,7 +605,7 @@ class BackendConsumer:
 
     def process_samples(
         self, discard: int | float = 0.0, ess: int = 10000, return_inds: bool = False
-    ) -> Tuple[dict, Optional[dict], np.ndarray, np.ndarray]:
+    ) -> Tuple[dict, dict, Optional[dict], np.ndarray, np.ndarray]:
         """
         Convenience method to run the end-to-end processing pipeline, starting from the raw samples.
 
@@ -464,21 +615,21 @@ class BackendConsumer:
             return_inds: bool (optional). Whether to return the corresponding inds arrays.
 
         Returns:
-            tuple: (transformed_samples, inds, log_prior, log_likelihood)
+            tuple: (original_samples, transformed_samples, inds, log_prior, log_likelihood)
         """
         if not self.configured:
             self.store_cold_chains()
 
-        samples, inds, log_prior, log_likelihood = self.get_independent_samples(
+        original_samples, inds, log_prior, log_likelihood = self.get_independent_samples(
             discard=discard, ess=ess, return_inds=True
         )
 
-        transformed_samples = self.transform(samples)
+        transformed_samples = self.transform(original_samples)
 
         if return_inds:
-            return transformed_samples, inds, log_prior, log_likelihood
+            return original_samples, transformed_samples, inds, log_prior, log_likelihood
 
-        return transformed_samples, log_prior, log_likelihood
+        return original_samples, transformed_samples, log_prior, log_likelihood
 
 
 # ——— Plotter ──────────────────────────────────────────────────────────────————
@@ -654,6 +805,13 @@ class GlobalFitPlotter:
             "input_data.h5",
         )
 
+        if not os.path.exists(os.path.dirname(filepath)):
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            logger.info(f"Created directory {os.path.dirname(filepath)} for saving converted input data.")
+
+        if os.path.exists(filepath):
+            logger.warning(f"File {filepath} already exists. It will be overwritten.")
+
         with h5py.File(filepath, "w") as f:
             for k, v in converted_data.items():
                 f.create_dataset(k, data=v)
@@ -679,7 +837,6 @@ def _extract_sensitivity_metadata(gi) -> tuple[dict, dict]:
     kwargs.pop("settings")
     kwargs.pop("window_values")
     kwargs["force_backend"] = "cpu"
-    kwargs.pop("galactic_grid") if "galactic_grid" in kwargs else None
 
     domain_metadata = {
         "class": domain_class,
@@ -796,9 +953,8 @@ class RunMetadata(MetadataBase):
         merged.setdefault("noise_model", type(gi.sensitivity_backend).__name__)
 
         instance = cls(**merged)
-        instance.submission_timestamp = datetime.now().isoformat(
-            timespec="seconds"
-        )  # stop at seconds for cleaner display
+        submission_timestamp_format = "%Y-%m-%dT%H%M%S" # change to 2026-05-06T100432-like
+        instance.submission_timestamp = datetime.now().strftime(submission_timestamp_format)  # stop at seconds for cleaner display
         instance.observation_period_begin = _seconds_to_l3c_datetime(gi.data_t0)
         instance.observation_period_end = _seconds_to_l3c_datetime(gi.data_t0 + gi.Tobs)
         instance.time_step = float(gi.dt)
@@ -1090,12 +1246,179 @@ class SubmissionWriter(BackendConsumer):
 
         super().__init__(curr=curr, backend=backend)
 
-        self.samples, self.inds, self.log_prior, self.log_likelihood = self.process_samples(
+        self.original_samples, self.samples, self.inds, self.log_prior, self.log_likelihood = self.process_samples(
             ess=ess, return_inds=True
-        )  # todo missing prior and likelihood
+        )
 
         self.detection_criteria = detection_criteria or OccupancyDetectionCriteria()
         self.run_metadata = RunMetadata.from_curr(self.curr)
+
+    def prepare_samples_for_submission(self, acs: AnalysisContainerArray):
+        """
+        Prepare the samples for submission by clustering the GBs, and sorting the mbhbs according to the coalescence time.
+        Each source type needs a callable to handle the specific processing, and this method act as a dispatcher.
+        """
+
+        for branch in self.branches:
+            prepare_fn = self.prepare_samples_registry.get(branch, None)
+            if prepare_fn:
+                logger.info(f"Preparing samples for branch '{branch}' using '{prepare_fn.__name__}'")
+                self.samples[branch], self.inds[branch] = prepare_fn(
+                    acs, self.original_samples[branch], self.samples[branch], self.inds[branch]
+                )
+
+    def _prepare_mbhb_samples(self, acs: AnalysisContainerArray, original_samples: np.ndarray, samples: np.ndarray, inds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Sort the MBHB samples according to the coalescence time, and cluster them if there are multiple sources in the same block."""
+
+        coalescence_time_idx = list(PARAMETER_INFO_REGISTRY["mbh"].keys()).index("t_c")
+        mean_coalescence_times = samples[:, :, coalescence_time_idx].mean(axis=0) # shape (nleaves_max,)
+        sorted_indices = np.argsort(mean_coalescence_times)
+        samples = samples[:, sorted_indices, :]
+        inds = inds[:, sorted_indices]
+
+        return samples, inds
+    
+    def _prepare_gb_samples(self, acs: AnalysisContainerArray, original_samples: np.ndarray, samples: np.ndarray, inds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Prepare GB samples for submission running the clustering algorithm.
+        """
+        try:
+            import cupy as cp
+        except ImportError:
+            raise ImportError("cupy is required for GB clustering. Please install cupy to use this feature.")
+        
+        from gbgpu.gbgpu import GBGPU
+        from lisatools.globalfit.hdfbackend import GBHDFBackend, GFHDFBackend
+        from lisatools.globalfit.state import GBState
+
+        gb_info = self.curr.source_info["gb"]
+        gb_wave_gen = GBGPU(**gb_info.initialize_kwargs)
+        gb_wave_gen.gpus = self.curr.general_info.gpus[:1] # use only one GPU for the clustering
+
+        cluster_kwargs = dict(
+            num_compare_samples=200,
+            samples_keep=5,
+            thin_by=1,
+            snr_lim_first_cut=7.0,
+            snr_lim_second_cut=5.0,
+            overlap_lim=0.7,
+            snr_diff_lim=20.0,
+        )
+        
+        reader = GFHDFBackend(
+            self.backend.filename, sub_state_bases={"gb": GBState}, sub_backend={"gb": GBHDFBackend}
+        )
+        
+        gb_wave_gen.d_d = 0.0
+        max_logl_walker = np.argmax(acs.likelihood()).item()
+        sens_mat = acs[max_logl_walker].sens_mat
+        
+        if len(acs.gpus) > 1:
+            # we probably need everything on the same GPU
+            cp.cuda.runtime.setDevice(gb_wave_gen.gpus[0])
+            sens_mat._sens_mat = cp.asarray(sens_mat._sens_mat)
+            
+        logger.info('starting to gather GB samples for clustering')
+        
+        groups = gather_gb_samples(
+            acs.f_arr,
+            gb_info.transform,
+            gb_wave_gen,
+            gb_info.waveform_kwargs.copy(),
+            cp.asarray(gb_info.band_edges),
+            gb_info.band_N_vals,
+            reader,
+            sens_mat,
+            gb_wave_gen.gpus[0],
+            gb_samples=original_samples,
+            gb_inds=inds,
+            **cluster_kwargs,
+        )
+
+        logger.info(f"Completed clustering. Number of groups found: {len(groups)}")
+
+        num_in_groups = np.asarray([len(tmp) for tmp in groups])
+        keep = num_in_groups > reader.nwalkers * cluster_kwargs['samples_keep'] / 2
+
+        logger.info(
+            f"Groups passing sample count filter: {keep.sum()} / {len(keep)}. "
+            f"num_in_groups: {num_in_groups}"
+        )
+        max_num_source = max([tmp.shape[0] for tmp in groups])
+        
+        samples_fin = np.full((len(groups), max_num_source, groups[0].shape[-1]), np.nan)
+        for i, group in enumerate(groups):
+            samples_fin[i, : len(group)] = group
+
+        samples_fin = samples_fin[keep] # shape (nclusters, nsteps, ndim)
+        num_in_groups_fin = num_in_groups[keep]
+
+        samples_fin = samples_fin.transpose(1, 0, 2)
+        inds_fin = np.isfinite(samples_fin[..., 0])
+
+        # now transform again from the sampling space to the physical space
+        samples_fin = gb_info.transform.both_transforms(samples_fin)
+
+        # now sort by frequency
+        frequency_idx = list(PARAMETER_INFO_REGISTRY["gb"].keys()).index("f0")
+        mean_frequencies = samples_fin[:, :, frequency_idx].mean(axis=0) # shape (nleaves_max,)
+        sorted_indices = np.argsort(mean_frequencies)
+        samples_fin = samples_fin[:, sorted_indices, :]
+        inds_fin = inds_fin[:, sorted_indices]
+
+        return samples_fin, inds_fin
+
+    @property
+    def prepare_samples_registry(self) -> dict[str, Callable[[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]:
+        """Registry mapping each source type to its corresponding sample preparation function."""
+        return {
+            "mbh": self._prepare_mbhb_samples,
+            "gb": self._prepare_gb_samples,
+        }
+
+    def _get_mbhb_label(self, leaf_samples: np.ndarray, leaf_index: int) -> str:
+        """Get a label for an MBHB source based on its coalescence time."""
+        
+        coalescence_time_idx = list(PARAMETER_INFO_REGISTRY["mbh"].keys()).index("t_c")
+        mean_coalescence_time = int(leaf_samples[:, coalescence_time_idx].mean())
+
+        xxxxx = f"{leaf_index:05d}"
+        yyyyy = f"{mean_coalescence_time}"
+        
+        return f"{xxxxx}_{yyyyy}"
+
+    def _get_gb_label(self, leaf_samples: np.ndarray, leaf_index: int) -> str:
+        """Get a label for a GB source based on its frequency."""
+        
+        frequency_idx = list(PARAMETER_INFO_REGISTRY["gb"].keys()).index("f0")
+        mean_frequency = leaf_samples[:, frequency_idx].mean()
+        mean_frequency_microhz = int(mean_frequency * 1e6)
+
+        xxxxx = f"{leaf_index:05d}"
+        yyyyy = f"{mean_frequency_microhz}"
+
+        return f"{xxxxx}_{yyyyy}"
+    
+    @property
+    def get_source_label_registry(self) -> dict[str, Callable]:
+        """Define how sources should be labelled in the output files.
+        For Mojito light, we use the XXXXX_YYYYY format, with XXXXX a 5 digit ID based on the leaf count (eg, 00000, 00001, etc) and YYYYY a descriptor of the source (eg, coalescence time for MBHBs, frequency for GBs, etc).
+        """
+
+        return {
+            "mbh": self._get_mbhb_label,
+            "gb": self._get_gb_label,
+        }
+
+    @property
+    def known_injections(self) -> dict[str, list[str]]:
+        """Return a dict mapping each source type to a list of known injections for that source type, to be included in the metadata."""
+        # for Mojito light, we don't have any known injections, so we return an empty list for each source type
+        return {
+            'mbh': _MOJITO_LIGHT_MBH_ORDER, 
+            'gb': []
+            }
+
 
     @property
     def submission_folder(self) -> str:
@@ -1103,11 +1426,11 @@ class SubmissionWriter(BackendConsumer):
         return self.run_metadata.submission_folder
 
     @property
-    def posterior_folder(self) -> dict[str, str]:
+    def posterior_folders(self) -> dict[str, str]:
         """Return the full paths to the posterior folders for each branch."""
-        if not hasattr(self, "_folders"):
+        if not hasattr(self, "_relative_folders"):
             raise ValueError("Folders have not been created yet. Call create_folders() first.")
-        return self._folders
+        return self._relative_folders
 
     def create_folders(self):
         """Create the submission folder and any necessary subfolders."""
@@ -1115,7 +1438,7 @@ class SubmissionWriter(BackendConsumer):
         os.makedirs(self.submission_folder, exist_ok=True)
         logger.info(f"Created submission folder at {self.submission_folder}")
 
-        self._folders = {}
+        self._relative_folders = {}
 
         for branch in self.branches:
             source_name = source_types_names[branch]
@@ -1126,137 +1449,246 @@ class SubmissionWriter(BackendConsumer):
             os.makedirs(subfolder_path, exist_ok=True)
             logger.info(f"Created subfolder for branch '{branch}' at {subfolder_path}")
 
-            self._folders[branch] = subfolder_path
+            self._relative_folders[branch] = subfolder_name # we store the relative path to the posterior folder, to be included in the metadata and used in the output files
 
     def save_posteriors(self):
         """Save the posterior samples for each detected source in the required format."""
         from tqdm import tqdm
 
+        self._save_stochastic_posterior()  
+        branches_resolvable = self.branches.copy()
+
+        for key in _STOCHASTIC_BRANCHES:
+            if key in branches_resolvable:
+                branches_resolvable.remove(key)
+
         # todo need a way to have ids
-        for branch in tqdm(self.branches, desc="Saving posteriors"):
+        for branch in tqdm(branches_resolvable, desc="Saving posteriors for resolvable sources"):
             logger.info(f"Saving posteriors for branch {branch}")
 
-            source_name = source_types_names[branch]
-            samples = self.samples[branch]
-            inds = self.inds[branch]
+            self._save_source_posterior(branch)
 
-            parameter_info: list[ParameterInfo] = list(PARAMETER_INFO_REGISTRY[branch].values())
+    def _save_source_posterior(self, branch: str):
+        """Save the posterior samples for a single detected source type, identified by `branch`."""
 
-            parameter_names = [p.l3c_name for p in parameter_info]
-            latex_names = [p.latex_name for p in parameter_info]
-            units = [p.unit for p in parameter_info]
+        source_name = source_types_names[branch]
+        samples = self.samples[branch]
+        inds = self.inds[branch]
 
-            metadata: SourceMetadata | StochasticMetadata = self.curr.source_metadata[branch]
+        parameter_info: list[ParameterInfo] = list(PARAMETER_INFO_REGISTRY[branch].values())
 
-            metadata.parameter_info = parameter_names
-            metadata.parameter_units = units
+        parameter_names = [p.l3c_name for p in parameter_info]
+        latex_names = [p.latex_name for p in parameter_info]
+        units = [p.unit for p in parameter_info]
 
-            if isinstance(metadata, SourceMetadata):
-                metadata.detection_statistic = self.detection_criteria.detection_statistics(
-                    samples, inds
-                ).tolist()
+        metadata: SourceMetadata = self.curr.source_metadata[branch]
 
-            posterior_files = []
+        metadata.parameter_info = parameter_names
+        metadata.parameter_units = units
 
-            MAX_SOURCES_PER_BATCH = 500
+        detection_stats = self.detection_criteria.detection_statistics(samples, inds).tolist()
 
-            num_leaves = samples.shape[1]
-            for i in range(0, num_leaves, MAX_SOURCES_PER_BATCH):
-                leaves = slice(i, min(i + MAX_SOURCES_PER_BATCH, num_leaves))
+        posterior_files_map: dict[str, str] = {}
+        label_to_statistic: dict[str, float] = {}
 
-                samples_here = samples[:, leaves, :]
-                num_sources_here = samples_here.shape[1]
-                logger.debug(f"Number of sources in this batch: {num_sources_here}")
+        num_leaves = samples.shape[1]
+        for leaf_count in range(0, num_leaves, MAX_SOURCES_PER_BATCH):
+            leaves = slice(leaf_count, min(leaf_count + MAX_SOURCES_PER_BATCH, num_leaves))
 
-                samples_dict = {
-                    name: samples_here[..., i] for i, name in enumerate(parameter_names)
-                }
-                samples_dict["log_prior"] = self.log_prior
-                samples_dict["log_likelihood"] = self.log_likelihood
+            samples_here = samples[:, leaves, :]
+            num_sources_here = samples_here.shape[1]
+            logger.debug(f"Number of sources in this batch: {num_sources_here}")
 
-                transform = _OUTPUT_CORRECTIONS_REGISTRY[branch]
-                for key, func in transform.items():
-                    if key in samples_dict:
-                        samples_dict[key] = func(samples_dict[key])
-                        logger.info(
-                            f"Applied output correction for parameter '{key}' in branch '{branch}'"
-                        )
+            # save to h5 file
+            filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{source_name}_posteriors_{num_sources_here}_{leaf_count}_{self.run_metadata.submission_timestamp}.h5"
+            filepath = os.path.join(self.posterior_folders[branch], filename)
+            with h5py.File(os.path.join(self.run_metadata.submission_folder, filepath), "w") as f:
+                for leaf in range(num_sources_here):
 
-                # save to h5 file
-                filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{source_name}_posteriors_{num_sources_here}_{i}_{self.run_metadata.submission_timestamp}.h5"
-                filepath = os.path.join(self.posterior_folder[branch], filename)
-                with h5py.File(filepath, "w") as f:
-                    for leaf in range(num_sources_here):
+                    source_label = self.get_source_label_registry[branch](samples_here[:, leaf, :], leaf_count + leaf)
+                    label_to_statistic[source_label] = detection_stats[leaf_count + leaf]
 
-                        param_data = []
-                        param_names = []
-                        for name, values in samples_dict.items():
-                            if name in _REMOVED_PARAMS_REGISTRY[branch]:
-                                logger.info(
-                                    f"Parameter '{name}' is marked for removal in branch '{branch}'. Skipping this parameter in the output."
-                                )
-                                continue
+                    leaf_samples = _build_leaf_samples_dict(
+                        samples_here=samples_here,
+                        parameter_names=parameter_names,
+                        leaf=leaf,
+                        branch=branch,
+                        log_prior=self.log_prior,
+                        log_likelihood=self.log_likelihood,
+                    )
+                    _save_posterior_dataset(f, source_label, leaf_samples)
 
-                            _value = (
-                                values[:, leaf] if len(values.shape) == 2 else values
-                            )  # log_prior and log_likelihood are (n_samples,) while parameters are (n_samples, nleaves)
-                            param_data.append(_value)
-                            param_names.append(name)
+                    posterior_files_map[source_label] = filepath
 
-                        dtype = [(name, "f8") for name in param_names]
-                        structured_array = np.zeros(len(param_data[0]), dtype=dtype)
-
-                        for name, data in zip(param_names, param_data):
-                            structured_array[name] = data
-
-                        f.create_dataset(f"posterior_{i + leaf}", data=structured_array)
-
-                        # g = f.create_group(f"posterior_{i + leaf}")
-                        # for param, values in samples_dict.items():
-                        #     print(values.shape)
-                        #     _value = values[:, leaf] if len(values.shape) == 2 else values # log_prior and log_likelihood are (n_samples,) while parameters are (n_samples, nleaves)
-                        #     g.create_dataset(param, data=_value)
-
-                logger.info(
-                    f"Saved posterior samples for branch '{branch}', leaves {leaves} to {filepath}"
-                )
-                posterior_files.append(filepath)
-
-            metadata.posterior_files = posterior_files
-
-            # now save the metadata for this source
-            metadata_base_filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{source_name}_{self.run_metadata.submission_timestamp}"
-
-            metadata_h5_filepath = os.path.join(
-                self.run_metadata.submission_folder, f"{metadata_base_filename}.h5"
-            )
-            metadata_json_filepath = os.path.join(
-                self.run_metadata.submission_folder, f"{metadata_base_filename}.json"
+            logger.info(
+                f"Saved posterior samples for branch '{branch}', leaves {leaves} to {filepath}"
             )
 
-            with h5py.File(metadata_h5_filepath, "w") as f:
-                # save all metadata fields as attributes
-                for field in dataclasses.fields(metadata):
-                    value = getattr(metadata, field.name)
-                    if isinstance(value, (str, int, float)):
-                        f.attrs[field.name] = value
-                    elif isinstance(value, list):
-                        f.attrs[field.name] = json.dumps(value)  # save lists as JSON strings
-                    elif isinstance(value, dict):
-                        f.attrs[field.name] = json.dumps(value)  # save dicts as JSON strings
-                    else:
-                        logger.warning(
-                            f"Unsupported metadata field type for '{field.name}': {type(value)}. Skipping this field."
-                        )
+        detections = []
+        known_injections_here = self.known_injections.get(branch, [])
 
-            logger.info(f"Saved metadata for branch '{branch}' to {metadata_h5_filepath}")
+        for j, source_idx in enumerate(posterior_files_map.keys()):
+            detections.append({
+                "source_id": str(source_idx),
+                "posterior_id": posterior_files_map[source_idx],
+                "comment": "",
+                "quality_flag": int(metadata.quality_flags[j]) if j < len(metadata.quality_flags) else 0,
+                "known_injection": known_injections_here[j] if j < len(known_injections_here) else "",
+                "detection_statistic": float(label_to_statistic[source_idx]),
+            })
 
-            metadata.to_json(metadata_json_filepath)
-            logger.info(f"Saved metadata for branch '{branch}' to {metadata_json_filepath}")
+        metadata.detection_statistic = list(label_to_statistic.values())
+        
+        metadata.detections = detections
 
-    def write_submission(self):
+        metadata.posterior_files = list(posterior_files_map.values())
+
+        # now save the metadata for this source
+        metadata_base_filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{source_name}_{self.run_metadata.submission_timestamp}"
+
+        metadata_h5_filepath = os.path.join(
+            self.run_metadata.submission_folder, f"{metadata_base_filename}.h5"
+        )
+        metadata_json_filepath = os.path.join(
+            self.run_metadata.submission_folder, f"{metadata_base_filename}.json"
+        )
+
+        with h5py.File(metadata_h5_filepath, "w") as f:
+            source_group = f.create_group(name="sources")
+            posterior_group = source_group.create_group(name="posterior_files")
+
+            for j, (source_idx, posterior_file_path) in enumerate(posterior_files_map.items()):
+                posterior_group.create_dataset(source_idx, data=str(posterior_file_path))
+
+            source_group.create_dataset(
+                "detection", data=detections_to_structured_array(detections)
+            )
+
+            _save_metadata_attributes(f, metadata)
+
+        logger.info(f"Saved metadata for branch '{branch}' to {metadata_h5_filepath}")
+
+        metadata.to_json(metadata_json_filepath)
+        logger.info(f"Saved metadata for branch '{branch}' to {metadata_json_filepath}")
+
+
+    def _save_stochastic_posterior(self):
+        """Save the posterior samples for the stochastic component, if applicable."""
+
+        if "psd" not in self.branches and "galfor" not in self.branches:
+            logger.info("No stochastic component detected in the branches. Skipping stochastic posterior saving.")
+            return
+
+        # check if both psd and galfor are present and store everything together
+        elif "psd" in self.branches and "galfor" in self.branches:
+            branches_here = ["psd", "galfor"]
+
+        # if only one of them is present, we save it as the stochastic posterior
+        else:
+            branch = "psd" if "psd" in self.branches else "galfor"
+            branches_here = [branch]
+        
+        samples, inds = [], []
+        parameter_info = []
+        metadata_list = []
+
+        for branch in branches_here:
+            _samples = self.samples[branch]
+            _inds = self.inds[branch]
+            _parameter_info = list(PARAMETER_INFO_REGISTRY[branch].values())
+            _metadata = self.curr.source_metadata[branch]
+
+            samples.append(_samples)
+            inds.append(_inds)
+            parameter_info.extend(_parameter_info)
+            metadata_list.append(_metadata)
+            
+        samples = np.concatenate(samples, axis=-1)
+        inds = np.concatenate(inds, axis=-1)
+
+        parameter_names = [p.l3c_name for p in parameter_info]
+        latex_names = [p.latex_name for p in parameter_info]
+        units = [p.unit for p in parameter_info]
+        metadata: StochasticMetadata = StochasticMetadata(
+            model_config={branch: metadata_list[i].model_config for i, branch in enumerate(branches_here)},
+            frequency_ranges=metadata_list[0].frequency_ranges,  # we assume the same frequency ranges for all stochastic branches; this can be relaxed if needed
+            prior_model=" ,".join(set(m.prior_model for m in metadata_list)),
+            prior_model_code_link=" ,".join(set(m.prior_model_code_link for m in metadata_list)),
+            prior_model_config={branch: metadata_list[i].prior_model_config for i, branch in enumerate(branches_here)},
+            comment=" ,".join(m.comment for m in metadata_list if m.comment)
+        )
+
+        metadata.parameter_info = parameter_names
+        metadata.parameter_units = units
+
+        if samples.shape[1] > 1:
+            raise NotImplementedError("multiple leaves detected, not implemented yet")
+
+        samples_dict = _build_stochastic_samples_dict(
+            samples=samples,
+            parameter_names=parameter_names,
+            branches_here=branches_here,
+            log_prior=self.log_prior,
+            log_likelihood=self.log_likelihood,
+        )
+        param_names = list(samples_dict.keys())
+        physical_param_names = [p for p in param_names if p not in ["logprior", "loglikelihood"]]
+        structured_array = posteriors_to_structured_array(samples_dict)
+
+        effective_branch_name = "noise" #todo or stochastic?
+        filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{effective_branch_name}_posteriors_{self.run_metadata.submission_timestamp}.h5"
+        filepath = os.path.join(self.posterior_folders[branches_here[0]], filename)
+
+        with h5py.File(os.path.join(self.run_metadata.submission_folder, filepath), "w") as f:
+            group = f.create_group(name=effective_branch_name)
+            group.attrs["labels"] = ", ".join(physical_param_names)
+            group.attrs["npars"] = len(physical_param_names)
+            group.attrs["nsamples"] = len(structured_array)
+            group.create_dataset("posterior", data=structured_array)
+
+            # add the noise/p, noise/logprior, noise/loglikelihood as separate datasets for convenience to match the requested setup. I would prefer to keep them as part of the structured array, but this can be easily changed if needed.
+            posterior_samples = np.stack([samples_dict[param] for param in physical_param_names], axis=-1) # we extract the posterior samples as a 2D array of shape (nsamples, npars) for convenience. These do not include the logprior and loglikelihood, which are stored separately.
+            group.create_dataset("p", data=posterior_samples)
+            group.create_dataset("logprior", data=samples_dict["logprior"])
+            group.create_dataset("loglikelihood", data=samples_dict["loglikelihood"]) 
+
+        metadata.posterior_file = filepath # we store the relative path to the posterior file in the metadata        
+        metadata_base_filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{effective_branch_name}_{self.run_metadata.submission_timestamp}"
+        metadata_h5_filepath = os.path.join(
+            self.run_metadata.submission_folder, f"{metadata_base_filename}.h5"
+        )
+        metadata_json_filepath = os.path.join(
+            self.run_metadata.submission_folder, f"{metadata_base_filename}.json"
+        )
+        with h5py.File(metadata_h5_filepath, "w") as f:
+            noise_group = f.create_group(name=effective_branch_name)
+            posterior_group = noise_group.create_group(name="posterior_file")
+            posterior_group.create_dataset("posterior", data=str(filepath))
+            _save_metadata_attributes(noise_group, metadata)
+
+        logger.info(f"Saved metadata for stochastic branch(es) to {metadata_h5_filepath}")
+
+        metadata.to_json(metadata_json_filepath)
+        logger.info(f"Saved metadata for  stochastic branch(es) to {metadata_json_filepath}")
+
+    def save_data_and_residuals(self, acs: AnalysisContainerArray):
+        """Save the input data and residuals to h5 files in the submission folder."""
+        data_filepath = os.path.join(self.submission_folder, "input_data.h5")
+        save_residuals(
+            self.curr.general_info.input_data_residual_array,
+            data_filepath,
+        )
+
+        logger.info(f"Saved input data to {data_filepath}")
+
+        residuals_filepath = os.path.join(self.submission_folder, "residuals.h5")
+        save_residuals(acs, residuals_filepath)
+        logger.info(f"Saved residuals to {residuals_filepath}")
+
+    def write_submission(self, acs: AnalysisContainerArray):
         """Run the full submission writing pipeline."""
         self.create_folders()
+        self.prepare_samples_for_submission(acs)
         self.save_posteriors()
 
         # finally save the overall run metadata
@@ -1264,28 +1696,37 @@ class SubmissionWriter(BackendConsumer):
         self.run_metadata.to_json(run_metadata_filepath)
         logger.info(f"Saved overall run metadata to {run_metadata_filepath}")
 
+        self.save_data_and_residuals(acs)
+
+
 
 # === Save residuals ====
 
-def save_residuals(acs: AnalysisContainerArray, filepath: str, is_residuals: bool = True):
+def save_residuals(data: AnalysisContainerArray | DataResidualArray, filepath: str):
     """
     Save residuals from the analysis container array to a file.
     
     Args:
-        acs: AnalysisContainerArray containing the residuals to save.
+        data: AnalysisContainerArray or DataResidualArray containing the residuals to save.
         filepath: Path to the file where the residuals should be saved.
-        is_residuals: Whether the data being saved are residuals (True) or the input data (False).
     """
-
-    num = len(acs) if is_residuals else 1
-    label = "residual" if is_residuals else "input_data"
-
     with h5py.File(filepath, "w") as f:
-        for i, ac in enumerate(acs.acs[:num]):
-            residual_array = ac.data_res_arr.data_res_arr.arr #shape: (num_channels, *(basis_domain_shape))
-            if hasattr(residual_array, 'get'):
-                residual_array = residual_array.get()  # convert from GPU array if necessary. 
-            f.create_dataset(f"{label}_{i}", data=residual_array)
+        _save_residuals_to_handle(data, f)
+
+def _save_residuals_to_handle(data, h5obj, label=None):
+    if isinstance(data, DataResidualArray):
+        residual_array = data.data_res_arr.arr
+        if hasattr(residual_array, "get"):
+            residual_array = residual_array.get()
+        if label is None:
+            label = "data"
+        h5obj.create_dataset(label, data=residual_array)
+
+    elif isinstance(data, AnalysisContainerArray):
+        if label is None:
+            label = "residual"
+        for i, ac in enumerate(data.acs):
+            _save_residuals_to_handle(ac.data_res_arr, h5obj, label=f"{label}_{i}")
 
 
 # ─── DetectionCriteria ────────────────────────────────────────────────────────

@@ -4,6 +4,7 @@ import os
 import time
 import logging
 import warnings
+from contextlib import nullcontext as _nullcontext
 from copy import deepcopy
 from inspect import Attribute
 from types import ModuleType
@@ -344,6 +345,43 @@ class Buffer(LISAToolsParallelModule):
         ).astype(cp.int32)
         return now_index
 
+    def _device_ctx(self, gpu):
+        """Device context for split ``gpu`` (no-op on CPU / when gpu is None)."""
+        from contextlib import nullcontext
+
+        return cp.cuda.Device(gpu) if gpu is not None else nullcontext()
+
+    def _setup_split_layout(self):
+        """Reproduce acs's deterministic walker→GPU split from ``gb.gpus``.
+
+        acs splits ``nwalkers`` cold-chain entries into contiguous blocks of
+        ``split_num = ceil(nwalkers / ngpu)`` (``np.split(arange(nwalkers), ...)``),
+        mapping block ``s`` to ``gpus[s]``. We mirror that here so that a
+        band-combo whose walker is ``w`` is routed to the same GPU that owns
+        walker ``w``'s residual, and so that ``walker % split_num`` recovers the
+        intra-split (per-GPU residual array) walker index.
+        """
+        gpus = getattr(self.gb, "gpus", None)
+        nw = self.nwalkers
+        if gpus is None or len(gpus) <= 1:
+            # single GPU (or CPU): one split holding all walkers — reduces
+            # exactly to the legacy single-buffer behaviour.
+            self.gpus_list = list(gpus) if gpus is not None else [None]
+            self.nsplits = 1
+            self.split_num_walker = nw
+            self.walker_gpu_map = np.full(nw, self.gpus_list[0] if self.gpus_list[0] is not None else 0)
+            self.walker_split_map = np.zeros(nw, dtype=int)
+            self.walker_intra_map = np.arange(nw, dtype=int)
+        else:
+            self.gpus_list = list(gpus)
+            self.nsplits = len(gpus)
+            split_num = int(np.ceil(nw / self.nsplits))
+            self.split_num_walker = split_num
+            w = np.arange(nw, dtype=int)
+            self.walker_split_map = (w // split_num).astype(int)
+            self.walker_intra_map = (w % split_num).astype(int)
+            self.walker_gpu_map = np.asarray([gpus[s] for s in self.walker_split_map], dtype=int)
+
     def __init__(
         self,
         is_rj,
@@ -392,6 +430,15 @@ class Buffer(LISAToolsParallelModule):
         self.edge_buffer = 2000
         self.is_rj = is_rj
 
+        # ---- multi-GPU split layout ----------------------------------------
+        # The band/psd/template buffers are held as one *full-size* array per
+        # GPU split (see allocation below). A band-combo's owning GPU is the GPU
+        # that holds its walker's residual in the shared AnalysisContainerArray.
+        # We reproduce acs's deterministic walker split here (contiguous blocks
+        # of ``ceil(nwalkers / ngpu)``) from ``gb.gpus``; the mapping is asserted
+        # against acs in ``fill_buffer_residual_and_psd_from_acs``.
+        self._setup_split_layout()
+
         self.special_indices_unique = special_indices_unique
         self.transform_fn = transform_fn
         self.waveform_kwargs = waveform_kwargs
@@ -411,26 +458,34 @@ class Buffer(LISAToolsParallelModule):
             self.psd_shape = (self.num_bands_now, self.nchannels, self.data_length)
             psd_size = self.num_bands_now * self.nchannels * self.data_length
         
-        self.band_buffer_tmp = cp.zeros(
-            (self.num_bands_now * self.nchannels * self.data_length), dtype=self.xp.complex128
-        )
-
-        self.psd_buffer_tmp = cp.zeros(psd_size, dtype=self.xp.complex128)
-
-        # careful here with accessing memory
-        self.band_buffer = self.band_buffer_tmp.reshape(
-            (self.num_bands_now, self.nchannels, self.data_length)
-        )
-        self.psd_buffer = self.psd_buffer_tmp.reshape(self.psd_shape)
-        
-        if self.use_template_arr:
-            self.template_buffer_tmp = cp.zeros(
-                (self.num_bands_now * self.nchannels * self.data_length), dtype=self.xp.complex128
-            )
-
-            self.template_buffer = self.template_buffer_tmp.reshape(
-                (self.num_bands_now, self.nchannels, self.data_length)
-            )
+        # Full-size buffers, ONE per GPU split, each allocated on its own device.
+        # A split only ever writes/reads the combos it owns; combos owned by other
+        # splits stay zero, which makes the per-split einsum likelihoods sum to the
+        # global result with no extra bookkeeping. ``*_tmp`` are the flat views
+        # GBGPU's kernels consume (one element of the list per GPU).
+        band_size = self.num_bands_now * self.nchannels * self.data_length
+        self.band_buffer_tmp = []
+        self.psd_buffer_tmp = []
+        self.band_buffer = []
+        self.psd_buffer = []
+        self.template_buffer_tmp = []
+        self.template_buffer = []
+        for gpu in self.gpus_list:
+            with self._device_ctx(gpu):
+                bt = cp.zeros(band_size, dtype=self.xp.complex128)
+                pt = cp.zeros(psd_size, dtype=self.xp.complex128)
+                self.band_buffer_tmp.append(bt)
+                self.psd_buffer_tmp.append(pt)
+                self.band_buffer.append(
+                    bt.reshape((self.num_bands_now, self.nchannels, self.data_length))
+                )
+                self.psd_buffer.append(pt.reshape(self.psd_shape))
+                if self.use_template_arr:
+                    tt = cp.zeros(band_size, dtype=self.xp.complex128)
+                    self.template_buffer_tmp.append(tt)
+                    self.template_buffer.append(
+                        tt.reshape((self.num_bands_now, self.nchannels, self.data_length))
+                    )
 
         # TODO: fix this 4????
         self.special_band_inds = special_band_inds
@@ -461,6 +516,14 @@ class Buffer(LISAToolsParallelModule):
 
         self.unique_band_combos = self.xp.array([_temp_inds, _walker_inds, _band_inds]).T
 
+        # Per-combo routing (computed on the main device). A combo's GPU/split is
+        # set purely by its walker (temperature-independent), so temperature-swap
+        # partners — which share the walker — always live on the same split.
+        _walker_cpu = self.xp.asnumpy(_walker_inds) if hasattr(self.xp, "asnumpy") else np.asarray(_walker_inds)
+        self.gpu_of_combo = self.xp.asarray(self.walker_gpu_map[_walker_cpu])
+        self.split_of_combo = self.xp.asarray(self.walker_split_map[_walker_cpu])
+        self.intra_walker_of_combo = self.xp.asarray(self.walker_intra_map[_walker_cpu])
+
         if self.num_bands == 1:
             tmp_buffer_start_index = (self.band_edges[0] / self.df).astype(
                 np.int32
@@ -479,7 +542,9 @@ class Buffer(LISAToolsParallelModule):
             self.buffer_start_index[self.unique_band_combos[:, 2] == 0] = (
                 self.band_edges[0] / self.df
             ).astype(np.int32) - self.edge_buffer
-            # self.buffer_start_index[self.unique_band_combos[:, 2] == self.num_bands - 1] = (self.band_edges[-1] / self.df).astype(np.int32) - self.edge_buffer
+            # Clamp so buffer end never overflows the data range (band_edges[-1])
+            max_start = int(self.band_edges[-1] / self.df) - self.data_length
+            self.buffer_start_index = np.minimum(self.buffer_start_index, max_start)
 
         self.start_freq_inds = self.xp.asarray(self.buffer_start_index.copy().astype(np.int32))
 
@@ -503,43 +568,67 @@ class Buffer(LISAToolsParallelModule):
     def likelihood(self, source_only: bool = False, noise_only: bool = False) -> float:
         assert not (source_only and noise_only)
 
-        # THIS HAS TO HAVE THE .COPY()
-        numerator_in = self.band_buffer.copy()
-        if self.use_template_arr:
-            numerator_in -= self.template_buffer
+        # Per-split reduction summed onto the main device. A combo not owned by
+        # split ``s`` has zero band/template/psd entries there, so its per-split
+        # source term is exactly 0 → summing across splits recovers the global,
+        # owner-only value with no index bookkeeping. Each split's einsum runs on
+        # its own device; results are moved to the main device and accumulated.
+        main_device = self.gpus_list[0]
 
-        if self.tdi_channel_setup == "XYZ":
-            # using einstein summation: b=bands, i=channel 1, j=channel 2, k=frequency
-            source_term = (
-                - (1.0 / 2.0) * 4.0 * self.df
-                * cp.einsum(
-                    "bik,bijk,bjk->b", numerator_in.conj(), self.psd_buffer, numerator_in
-                ).real
-            )
-            
-            if noise_only:
-                raise NotImplementedError("Noise-only likelihood requires log=determinant over frequency for XYZ CSD.")
-        
-        else:
-            source_term = (
-                - (1.0 / 2.0) * 4.0 * self.df
-                * cp.sum((numerator_in.conj() * numerator_in) * self.psd_buffer, axis=(1, 2)).real
-            )
+        source_total = None
+        psd_total = None
 
-            if noise_only:
-                return -cp.sum(cp.log(cp.abs(1 / self.psd_buffer[self.psd_buffer != 0.0])))
-            
+        for s, gpu in enumerate(self.gpus_list):
+            with self._device_ctx(gpu):
+                # THIS HAS TO HAVE THE .COPY()
+                numerator_in = self.band_buffer[s].copy()
+                if self.use_template_arr:
+                    numerator_in -= self.template_buffer[s]
+
+                psd_buffer = self.psd_buffer[s]
+
+                if self.tdi_channel_setup == "XYZ":
+                    # einstein summation: b=bands, i=channel 1, j=channel 2, k=frequency
+                    source_term_s = (
+                        - (1.0 / 2.0) * 4.0 * self.df
+                        * cp.einsum(
+                            "bik,bijk,bjk->b", numerator_in.conj(), psd_buffer, numerator_in
+                        ).real
+                    )
+                    if noise_only:
+                        raise NotImplementedError("Noise-only likelihood requires log=determinant over frequency for XYZ CSD.")
+                else:
+                    source_term_s = (
+                        - (1.0 / 2.0) * 4.0 * self.df
+                        * cp.sum((numerator_in.conj() * numerator_in) * psd_buffer, axis=(1, 2)).real
+                    )
+                    if noise_only:
+                        noise_s = -cp.sum(cp.log(cp.abs(1 / psd_buffer[psd_buffer != 0.0])))
+                        with self._device_ctx(main_device):
+                            psd_total = cp.asarray(noise_s) if psd_total is None else psd_total + cp.asarray(noise_s)
+                        continue
+
+                if not source_only:
+                    # Diagonal noise_term fall_back. # TODO check sufficiency; unused currently.
+                    psd_term_s = -cp.sum(cp.log(cp.abs(psd_buffer[psd_buffer != 0.0])))
+
+            with self._device_ctx(main_device):
+                source_term_s = cp.asarray(source_term_s)
+                source_total = source_term_s if source_total is None else source_total + source_term_s
+                if not source_only:
+                    psd_term_s = cp.asarray(psd_term_s)
+                    psd_total = psd_term_s if psd_total is None else psd_total + psd_term_s
+
+        if noise_only:
+            return psd_total
+
         if source_only:
-            return source_term
-        
-        # Diagonal noise_term fall_back # TODO check if this is sufficient not used currently anyway
-        psd_term = -cp.sum(cp.log(cp.abs(self.psd_buffer[self.psd_buffer != 0.0])))
+            return source_total
+
         if self.tdi_channel_setup == "XYZ":
             warnings.warn("The current psd ll calculation is not correct for XYZ CSD channel setup.")
-        
-        # cp.get_default_memory_pool().free_all_blocks()
-        
-        return source_term + psd_term
+
+        return source_total + psd_total
     
 
     def get_swap_ll(self, params_remove, params_add, data_index, N_vals, phase_maximize=False):
@@ -556,9 +645,9 @@ class Buffer(LISAToolsParallelModule):
             wave_kwargs_tmp.pop("start_freq_ind")
 
         # check for out-of-bound error when frequency indexing
-        if np.any((params_add_in[:, 1] / self.df).astype(int) - self.start_freq_inds[data_index] + (N_vals / 2) >  self.band_buffer.shape[-1]):
+        if np.any((params_add_in[:, 1] / self.df).astype(int) - self.start_freq_inds[data_index] + (N_vals / 2) >  self.data_length):
             breakpoint()
-        if np.any((params_remove_in[:, 1] / self.df).astype(int) - self.start_freq_inds[data_index] + (N_vals / 2) >  self.band_buffer.shape[-1]):
+        if np.any((params_remove_in[:, 1] / self.df).astype(int) - self.start_freq_inds[data_index] + (N_vals / 2) >  self.data_length):
             breakpoint()
         if np.any((params_add_in[:, 1] / self.df).astype(int) - self.start_freq_inds[data_index] - (N_vals / 2) < 0):
             breakpoint()
@@ -576,10 +665,10 @@ class Buffer(LISAToolsParallelModule):
         #         q_add - self.start_freq_inds[data_index] - (N_vals / 2) < 0
         #     )
         #     | ( # TODO check if the change from > to >= is valid
-        #         q_remove - self.start_freq_inds[data_index] + (N_vals / 2) >= self.band_buffer.shape[-1]
+        #         q_remove - self.start_freq_inds[data_index] + (N_vals / 2) >= self.data_length
         #     )
         #     | (
-        #         q_add - self.start_freq_inds[data_index] + (N_vals / 2) >= self.band_buffer.shape[-1]
+        #         q_add - self.start_freq_inds[data_index] + (N_vals / 2) >= self.data_length
         #     )
         # )
         keep = ~(
@@ -599,13 +688,13 @@ class Buffer(LISAToolsParallelModule):
                 (params_remove_in[:, 1] / self.df).astype(int)
                 - self.start_freq_inds[data_index]
                 + (N_vals / 2)
-                > self.band_buffer.shape[-1]
+                > self.data_length
             )
             | (
                 (params_add_in[:, 1] / self.df).astype(int)
                 - self.start_freq_inds[data_index]
                 + (N_vals / 2)
-                > self.band_buffer.shape[-1]
+                > self.data_length
             )
         )
 
@@ -629,8 +718,9 @@ class Buffer(LISAToolsParallelModule):
                 noise_index=data_index_keep,
                 adjust_inplace=False,
                 N=N_vals_keep,
-                data_length=self.band_buffer.shape[-1],
-                data_splits=np.full(self.band_buffer.shape[0], self.gb.gpus[0]),
+                data_length=self.data_length,
+                data_splits=self.gpu_of_combo,
+                num_per_gpu=self.num_bands_now,
                 phase_marginalize=phase_maximize,
                 return_cupy=True,
                 **wave_kwargs_tmp,
@@ -654,8 +744,8 @@ class Buffer(LISAToolsParallelModule):
         #     data_index=data_index,
         #     noise_index=data_index,
         #     N=N_vals,
-        #     data_length=self.band_buffer.shape[-1],
-        #     data_splits=np.full(self.band_buffer.shape[0], self.gb.gpus[0]),
+        #     data_length=self.data_length,
+        #     data_splits=np.full(self.num_bands_now, self.gb.gpus[0]),
         #     phase_marginalize=False,  # phase_maximize,
         #     return_cupy=True,
         #     **wave_kwargs_tmp,
@@ -712,91 +802,122 @@ class Buffer(LISAToolsParallelModule):
     def reset_residual_buffers(self, inds_fill=None):
         if inds_fill is None:
             inds_fill = cp.arange(self.num_bands_now)
-        self.band_buffer[inds_fill] = 0.0
+        inds_host = self.xp.asnumpy(inds_fill) if hasattr(self.xp, "asnumpy") else np.asarray(inds_fill)
+        for s, gpu in enumerate(self.gpus_list):
+            with self._device_ctx(gpu):
+                self.band_buffer[s][cp.asarray(inds_host)] = 0.0
 
     def reset_psd_buffers(self, inds_fill=None):
         if inds_fill is None:
             inds_fill = cp.arange(self.num_bands_now)
-        self.psd_buffer[inds_fill] = 0.0
-
-    # def fill_buffer_residual_from_acs(self, acs):
-    #     inds_get = self._get_fill_buffer_ind_map(acs)
-    #     self.reset_residual_buffers()
-    #     self.band_buffer[:self.num_bands_now] += rest_of_data[:]
-
-    # def fill_buffer_psd_from_acs(self, acs):
-    #     inds_get = self._get_fill_buffer_ind_map(acs)
-    #     self.reset_psd_buffers()
-    #     self.psd_buffer[:self.num_bands_now] = acs.psd_shaped[0][inds_get].reshape((self.num_bands_now,) + self.band_buffer.shape[1:])
+        inds_host = self.xp.asnumpy(inds_fill) if hasattr(self.xp, "asnumpy") else np.asarray(inds_fill)
+        for s, gpu in enumerate(self.gpus_list):
+            with self._device_ctx(gpu):
+                self.psd_buffer[s][cp.asarray(inds_host)] = 0.0
 
     def fill_buffer_residual_and_psd_from_acs(
         self, acs: AnalysisContainerArray, inds_fill: Optional[cp.ndarray] = None
     ) -> None:
-        
+        """Fill each split's full-size band/psd buffer from acs.
+
+        For multi-GPU runs the residual/PSD live split across GPUs in
+        ``acs.data_shaped[split]`` / ``acs.psd_shaped[split]``. Each combo is
+        owned by the GPU that holds its walker's residual, so we fill split ``s``
+        only with the combos it owns, reading them with the **intra-split** walker
+        index. Combos owned by other splits remain zero on split ``s`` (which is
+        what makes the per-split einsum likelihoods sum cleanly).
+        """
         if inds_fill is None:
             inds_fill = cp.arange(self.num_bands_now)
 
-        inds_get_data = self._get_fill_buffer_ind_map(acs, inds_fill=inds_fill, is_psd=False)
-        
-        # load rest of data into buffer (has current sources removed)
-        self.reset_residual_buffers(inds_fill=inds_fill)
-        
-        # By removing `.flatten()` during indexing, broadcasting gives us the exact shape natively. 
-        self.band_buffer[inds_fill] += acs.data_shaped[0][inds_get_data]
-        del inds_get_data
-
-        inds_get_psd = self._get_fill_buffer_ind_map(acs, inds_fill=inds_fill, is_psd=True)
-        self.reset_psd_buffers(inds_fill=inds_fill)
-
-        self.psd_buffer[inds_fill] = acs.psd_shaped[0][inds_get_psd]
-
-        del inds_get_psd
-
-    def _get_fill_buffer_ind_map(
-        self, acs: AnalysisContainerArray, inds_fill: Optional[cp.ndarray] = None, is_psd: bool = False
-    ) -> Tuple[cp.ndarray, ...]:
-        
-        if inds_fill is None:
-            inds_fill = cp.arange(self.num_bands_now)
+        # Safety: our split layout (derived from gb.gpus) must agree with acs's.
+        if acs.gpus is not None and len(acs.gpus) > 1:
+            assert np.array_equal(
+                np.asarray(self.walker_gpu_map), np.asarray(acs.gpu_map)
+            ), "Buffer walker→GPU map disagrees with AnalysisContainerArray.gpu_map."
 
         assert np.all(acs.start_freq_ind[0] == acs.start_freq_ind)
-        start_freq_ind = acs.start_freq_ind[0]
-        
-        try:
-            assert np.all((self.buffer_start_index[inds_fill] - start_freq_ind) >= 0)
-        except AssertionError:
-            breakpoint()
-            
-        assert np.all(
-            (self.buffer_start_index[inds_fill] - start_freq_ind + self.data_length)
-            <= acs.end_shape[0]
-        )
-        
-        start_inds = self.buffer_start_index[inds_fill] - start_freq_ind
-        
+        start_freq_ind = int(acs.start_freq_ind[0])
+
+        self.reset_residual_buffers(inds_fill=inds_fill)
+        self.reset_psd_buffers(inds_fill=inds_fill)
+
+        # Host copies for cross-device slicing (small arrays).
+        inds_host = self.xp.asnumpy(inds_fill) if hasattr(self.xp, "asnumpy") else np.asarray(inds_fill)
+        split_host = self.xp.asnumpy(self.split_of_combo) if hasattr(self.xp, "asnumpy") else np.asarray(self.split_of_combo)
+        intra_host = self.xp.asnumpy(self.intra_walker_of_combo) if hasattr(self.xp, "asnumpy") else np.asarray(self.intra_walker_of_combo)
+        bsi_host = self.xp.asnumpy(self.buffer_start_index) if hasattr(self.xp, "asnumpy") else np.asarray(self.buffer_start_index)
+
+        # Resolve the per-split views ONCE, outside any device context. Both are
+        # properties that loop all splits calling ``setDevice`` internally, so
+        # invoking them inside ``with Device(gpu)`` would leave the current device
+        # pointing at the last split (a ≥2-GPU-only correctness bug).
+        data_shaped = acs.data_shaped
+        psd_shaped = acs.psd_shaped
+
+        for s, gpu in enumerate(self.gpus_list):
+            owned = inds_host[split_host[inds_host] == s]
+            if owned.shape[0] == 0:
+                continue
+
+            start_inds_s = bsi_host[owned] - start_freq_ind
+            intra_s = intra_host[owned]
+
+            try:
+                assert np.all(start_inds_s >= 0)
+                assert np.all((start_inds_s + self.data_length) <= acs.end_shape[0]), (
+                    f"Buffer indexing exceeds available data length. start_inds={start_inds_s}, "
+                    f"start_freq_ind={start_freq_ind}, data_length={self.data_length}, "
+                    f"acs end shape={acs.end_shape[0]}"
+                )
+            except AssertionError:
+                breakpoint()
+                raise
+
+            with self._device_ctx(gpu):
+                owned_dev = cp.asarray(owned)
+                intra_dev = cp.asarray(intra_s)
+                start_dev = cp.asarray(start_inds_s)
+
+                data_inds = self._fill_index_map(intra_dev, start_dev, is_psd=False)
+                self.band_buffer[s][owned_dev] += data_shaped[s][data_inds]
+
+                psd_inds = self._fill_index_map(intra_dev, start_dev, is_psd=True, psd_ndim=psd_shaped[s].ndim)
+                self.psd_buffer[s][owned_dev] = psd_shaped[s][psd_inds]
+
+    def _fill_index_map(
+        self, intra_walker: cp.ndarray, start_inds: cp.ndarray, is_psd: bool = False, psd_ndim: int = None
+    ) -> Tuple[cp.ndarray, ...]:
+        """Fancy-index tuple into the split's ``data``/``psd`` array for its owned
+        combos. ``intra_walker`` is the per-split (intra-split) walker index;
+        ``start_inds`` is the frequency offset into the split's array; ``psd_ndim``
+        is the (already-resolved) PSD array ndim. All inputs must already be on the
+        split's device — callers must NOT invoke acs view-properties here, since
+        those flip the current device as a side effect."""
+        freq = cp.arange(self.data_length)
+
         if is_psd and self.tdi_channel_setup == "XYZ":
-            # Target output shape: (len(inds_fill), self.nchannels, self.nchannels, self.band_buffer.shape[-1])
-            if acs.psd_shaped[0].ndim == 4:
-                inds0 = self.unique_band_combos[inds_fill, 1][:, None, None, None]
+            # Target shape: (n_owned, nchannels, nchannels, data_length)
+            if psd_ndim == 4:
+                inds0 = intra_walker[:, None, None, None]
                 inds1 = cp.arange(self.nchannels)[None, :, None, None]
                 inds2 = cp.arange(self.nchannels)[None, None, :, None]
-                inds3 = start_inds[:, None, None, None] + cp.arange(self.band_buffer.shape[-1])[None, None, None, :]
+                inds3 = start_inds[:, None, None, None] + freq[None, None, None, :]
                 return inds0, inds1, inds2, inds3
             else:
                 inds1 = (
-                    self.unique_band_combos[inds_fill, 1][:, None, None, None] 
-                    * self.nchannels 
+                    intra_walker[:, None, None, None]
+                    * self.nchannels
                     + cp.arange(self.nchannels)[None, :, None, None]
                 )
                 inds2 = cp.arange(self.nchannels)[None, None, :, None]
-                inds3 = start_inds[:, None, None, None] + cp.arange(self.band_buffer.shape[-1])[None, None, None, :]
-            
+                inds3 = start_inds[:, None, None, None] + freq[None, None, None, :]
         else:
-            # Target output shape: (len(inds_fill), self.nchannels, self.band_buffer.shape[-1])
-            inds1 = self.unique_band_combos[inds_fill, 1][:, None, None]
+            # Target shape: (n_owned, nchannels, data_length)
+            inds1 = intra_walker[:, None, None]
             inds2 = cp.arange(self.nchannels)[None, :, None]
-            inds3 = start_inds[:, None, None] + cp.arange(self.band_buffer.shape[-1])[None, None, :]
-            
+            inds3 = start_inds[:, None, None] + freq[None, None, :]
+
         return inds1, inds2, inds3
 
     def remove_sources_from_template_buffer(self, *args, **kwargs) -> None:
@@ -823,13 +944,18 @@ class Buffer(LISAToolsParallelModule):
         if "start_freq_ind" in wave_kwargs_tmp:
             wave_kwargs_tmp.pop("start_freq_ind")
         try:
+            # ``input_array`` is the per-split list of flat buffers. ``data_splits``
+            # maps each combo (indexed by ``params_index``) to its owning GPU, and
+            # ``num_per_gpu == num_bands_now`` makes the global combo index address
+            # each split's full-size buffer directly (modulo is the identity).
             self.gb.generate_global_template(
                 params_in,
                 params_index,
                 input_array,
-                data_length=self.band_buffer.shape[-1],
+                data_length=self.data_length,
                 factors=factors_change,
-                data_splits=np.full(self.band_buffer.shape[0], self.gb.gpus[0]),
+                data_splits=self.gpu_of_combo,
+                num_per_gpu=self.num_bands_now,
                 N=N_vals,
                 start_freq_ind=self.start_freq_inds,
                 **wave_kwargs_tmp,
@@ -842,6 +968,24 @@ class Buffer(LISAToolsParallelModule):
 
     def add_sources_to_band_buffer(self, *args, **kwargs) -> None:
         self.adjust_sources_in_band_buffer(-1, self.band_buffer_tmp, *args, **kwargs)
+
+    def swap_template_combos(self, combo_inds_1, combo_inds_2) -> None:
+        """Swap template-buffer entries at ``combo_inds_1`` with ``combo_inds_2``
+        across every split (used by the band temperature swaps in ``run_tempering``).
+
+        A temperature-swap pair shares its walker, hence its split, so the swap is
+        always intra-split: for the owning split both indices carry real data; for
+        every other split both are zero, so applying the same swap to each split's
+        buffer is correct (zeros swap harmlessly)."""
+        i1_host = self.xp.asnumpy(combo_inds_1) if hasattr(self.xp, "asnumpy") else np.asarray(combo_inds_1)
+        i2_host = self.xp.asnumpy(combo_inds_2) if hasattr(self.xp, "asnumpy") else np.asarray(combo_inds_2)
+        for s, gpu in enumerate(self.gpus_list):
+            with self._device_ctx(gpu):
+                a = cp.asarray(i1_host)
+                b = cp.asarray(i2_host)
+                tmp = self.template_buffer[s][a].copy()
+                self.template_buffer[s][a] = self.template_buffer[s][b]
+                self.template_buffer[s][b] = tmp
 
     def get_special_band_index(
         self, temp_inds: np.ndarray, walker_inds: np.ndarray, band_inds: np.ndarray
@@ -970,6 +1114,7 @@ class BandSorter(LISAToolsParallelModule):
             # else:
             proposal_logpdf = cp.zeros(self.coords.shape[0])
 
+            # breakpoint()
             batch_here = int(1e6)
             inds_splitting = np.arange(0, self.coords.shape[0], batch_here)
             if inds_splitting[-1] != self.coords.shape[0] - 1:
@@ -1255,7 +1400,7 @@ class BandSorter(LISAToolsParallelModule):
         num_bands = len(self.band_edges) - 1
         band_counts = np.zeros((self.ntemps, self.nwalkers, num_bands), dtype=int)
         band_counts[uni_temp_inds.get(), uni_walker_inds.get(), uni_band_inds.get()] = (
-            uni_special_counts.get()
+            getattr(uni_special_counts, "get")()
         )
 
         return {"band_counts": band_counts}
@@ -1290,11 +1435,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         gpu_priors,
         *args,
         waveform_kwargs={},
-        parameter_transforms=None,
+        parameter_transforms: Optional[TransformContainer] = None,
         snr_lim=1e-10,
         rj_proposal_distribution=None,
         is_rj_prop=False,
-        num_repeat_proposals=300,
+        num_repeat_proposals=100,
         name=None,
         use_prior_removal=False,
         phase_maximize=False,
@@ -1302,15 +1447,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         gpus=[],
         num_band_preload=20000,
         run_swaps=True,
-        # TODO: make this adjustable?
         max_data_store_size=6000,
         force_backend=None,
-        **kwargs,
+        search_kwargs=None,
+        **kwargs
     ):
         # return_gpu is a kwarg for the stretch move
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
         GlobalFitMove.__init__(self, name=name)
-        GroupStretchMove.__init__(self, *args, return_gpu=True, **kwargs)
+        Move.__init__(self, *args, return_gpu=True, **kwargs)
+        # kwargs_group = dict(
+        #     n_iter_update=1,
+        #     live_dangerously=True,
+        #     a=1.75,
+        #     num_repeat_proposals=200,
+        #     nfriends=32
+        # )
+        # GroupStretchMove.__init__(self, *args, return_gpu=True, **kwargs_group)
 
         self.force_backend = force_backend
         self.ranks_needed = ranks_needed
@@ -1374,10 +1527,31 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self.band_N_vals = self.xp.asarray(band_N_vals)
         
         self.num_proposals = 0
+        self.search_kwargs = search_kwargs
         
 
     def setup(self, model, branches):
         return
+
+    def synchronize_all_devices(self):
+        """Synchronize every GPU the GB move spans (not just the current device).
+
+        With the band/psd/template buffers split across GPUs, a single
+        ``deviceSynchronize()`` only blocks on the current device and would let
+        kernels on the other splits race ahead. This loops over all of
+        ``gb.gpus`` so the proposal has a single, correct barrier. Kept as one
+        helper so an async variant can later make the per-device sync conditional
+        without touching call sites.
+        """
+        gpus = getattr(self.gb, "gpus", None)
+        if gpus is None:
+            self.xp.cuda.runtime.deviceSynchronize()
+            return
+        main_device = self.xp.cuda.runtime.getDevice()
+        for gpu in gpus:
+            with self.xp.cuda.Device(gpu):
+                self.xp.cuda.runtime.deviceSynchronize()
+        self.xp.cuda.runtime.setDevice(main_device)
 
     @classmethod
     def supported_backends(cls):
@@ -1658,13 +1832,22 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         
         # ac_data_arr_in = model.analysis_container_arr.linear_data_arr.copy()
         # ll_before_update = model.analysis_container_arr.likelihood().copy()
+        acs = model.analysis_container_arr
+        # On the residual (walker) axis acs lays walkers out in contiguous blocks
+        # of ``len(gpu_splits[0])`` per GPU, so ``walker % num_per_gpu_walker``
+        # recovers the intra-split residual index. Only required (and only valid)
+        # for >1 GPU; left None for single-GPU so GBGPU keeps its 1-GPU fast path.
+        num_per_gpu_walker = (
+            len(acs.gpu_splits[0]) if (acs.gpus is not None and len(acs.gpus) > 1) else None
+        )
         self.gb.generate_global_template(
             params_in,
             walkers_in,
-            model.analysis_container_arr.linear_data_arr,
-            data_length=model.analysis_container_arr.end_shape[0],
+            acs.linear_data_arr,
+            data_length=acs.end_shape[0],
             factors=factors_tmp,
-            data_splits=model.analysis_container_arr.gpu_map,
+            data_splits=acs.gpu_map,
+            num_per_gpu=num_per_gpu_walker,
             N=N_vals_in,
             **self.waveform_kwargs,
         )
@@ -1925,8 +2108,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # that way the recalculation technically only changes newly found sources
                 have_not_run_in_model = True
                 previous_inds = band_sorter.inds.copy()
+                counter_infomat = 0
+                time_spent_infomat = 0.0
                 for move_i in range(self.num_repeat_proposals):
-                    is_rj_now = bool(np.random.choice([0, 1], p=[0.97, 0.03]))
+
+                    is_rj_now = bool(np.random.choice([0, 1], p=[0.80, 0.20])) # todo make custom
 
                     if band_sorter.inds[source_map_now].sum() == 0:
                         is_rj_now = True
@@ -1974,6 +2160,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         if num_chol_new > 0:
                             has_chol[new_chol] = True
 
+                            time_infomat_start = time.perf_counter()
                             # due to fixed, it will not change during run through of the proposal
                             # unless rj causes leaf addition/removal
                             new_chol_params_fixed = fixed_coords_for_info_mat[
@@ -1993,7 +2180,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                                 1: info_mat_transforms_global[r"$f_0$"],
                                 2: lambda x: x * fdot_scale,
                                 5: info_mat_transforms_global[r"$\cos\iota$"],
-                                8: info_mat_transforms_global[r"$\sin\beta$"],
+                                8: info_mat_transforms_global[r"$\sin\delta$"],
                             }
 
                             # transform fdot
@@ -2004,8 +2191,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                             _tmp_waveform_kwargs = self.waveform_kwargs.copy()
                             _tmp_waveform_kwargs.pop("start_freq_ind")
                             
-                            # print("Number of params to calculate FIM for is", info_mat_params.shape[0])
-                            
+                            logger.info("Number of params to calculate FIM for is %d", info_mat_params.shape[0])
                             info_mat = self.gb.information_matrix(
                                 info_mat_params,
                                 psd = model.analysis_container_arr.linear_psd_arr,
@@ -2014,7 +2200,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                                 inds = self.xp.asarray(_test_inds),
                                 easy_central_difference=False,
                                 noise_index = walker_inds_chol,
-                                N = 1024,
+                                N = 512,
                                 data_length = model.analysis_container_arr.end_shape[0],
                                 batch_size = 10000,
                                 **_tmp_waveform_kwargs,                                
@@ -2071,6 +2257,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                             chol_store = _chol_store
                             chol_params_fixed = _chol_params_fixed
                             inds_map_chol = _inds_map_chol
+
+                            time_spent_infomat += time.perf_counter() - time_infomat_start
+                            counter_infomat += 1
 
                         remove_chol = has_chol & (~band_sorter.inds[source_map_now])
                         num_chol_remove = remove_chol.sum().item()
@@ -2233,6 +2422,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         prev_logp[inds] = logp_tmp[inds]
                         curr_logp[~inds] = logp_tmp[~inds]
 
+                    # check if any proposals have -inf logp before likelihood calculation to catch issues early
+                    if cp.all(~cp.isfinite(prev_logp)):  # [run_now_tmp]
+                        logger.warning("Found -inf logp in previous logp.")
+                        # check which parameters have -inf logp and why
+                        # bad_idx = cp.where(~cp.isfinite(prev_logp))[0]
+                        # for idx in bad_idx:
+                        #     logger.warning(f"Parameter with -inf logp at index {idx}: {params_to_update[idx]}. Prior limits are:")
+
+                        # for param_name, prior in self.gpu_priors["gb"].priors_in.items():
+                        #     logger.warning(f"  {param_name}: [{prior.min_val},{prior.max_val}]")
+                        #breakpoint()
                     # if cp.any(cp.isinf(prev_logp)):  # [run_now_tmp]
                     #     breakpoint()
                     # inputs into swap proposal
@@ -2357,7 +2557,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                             if "fstat" in self.name or "refit" in self.name:
                                 pass
                             else:
-                                breakpoint()
+                                logger.info(f"delta_logP: {delta_logP[bad_accepts]}. Factors: {update_factors.squeeze()[bad_accepts]}. ll_diff: {ll_diff[bad_accepts]}. curr_logp: {curr_logp[bad_accepts]}. prev_logp: {prev_logp[bad_accepts]}. curr_beta: {curr_beta[bad_accepts]}")
                         accept[bad_accepts] = False
                             
                     if is_rj_now and self.use_prior_removal:
@@ -2474,6 +2674,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # RJ COUNT IS PROPORTIONAL TO NUMBER OF SOURCES IN THE BAND,
                 # SO IT WILL ALSO ACCOUNT FOR NUM_REPEAT_PROPOSALS FOR IN-MODEL
                 run_count[inds_now] = current_rj_counter
+                logger.info(f"The information matrix was calculated {counter_infomat} times over {self.num_repeat_proposals} proposal repeats, for a total of {time_spent_infomat:.2f} seconds.")
 
                 # if not self.is_rj_prop:
                 #     # should be subset for in model
@@ -2521,10 +2722,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # llaf2 = model.analysis_container_arr.likelihood(source_only=True)
             # breakpoint()
             # ll_change_sum = ll_change_log.sum(axis=-1)
-            # check_in = state.log_like[0] + ll_change_sum[0].get()    
-                
-            self.xp.cuda.runtime.deviceSynchronize()
-    
+            # check_in = state.log_like[0] + ll_change_sum[0].get()
+
+            self.synchronize_all_devices()
+
 
         return ll_change_log
 
@@ -2633,9 +2834,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     buffer_i2 = cp.arange(buffer_obj.num_bands_now)[i2 :: self.ntemps]
 
                     # IMPORTANT: MAPPING IMPLICITLY UNDERSTANDS WHERE THINGS WILL BE
-                    tmp_buffer = buffer_obj.template_buffer[buffer_i1].copy()
-                    buffer_obj.template_buffer[buffer_i1] = buffer_obj.template_buffer[buffer_i2]
-                    buffer_obj.template_buffer[buffer_i2] = tmp_buffer[:]
+                    buffer_obj.swap_template_combos(buffer_i1, buffer_i2)
 
                     # TODO: add indices because not every likelihood is needed
                     new_lls = buffer_obj.likelihood(source_only=True).reshape(-1, self.ntemps)[
@@ -2660,11 +2859,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     buffer_i1_reject = buffer_i1[~sel]
                     buffer_i2_reject = buffer_i2[~sel]
 
-                    tmp_i1 = buffer_obj.template_buffer[buffer_i1_reject].copy()
-                    buffer_obj.template_buffer[buffer_i1_reject] = buffer_obj.template_buffer[
-                        buffer_i2_reject
-                    ]
-                    buffer_obj.template_buffer[buffer_i2_reject] = tmp_i1[:]
+                    buffer_obj.swap_template_combos(buffer_i1_reject, buffer_i2_reject)
 
                     band_swaps_accepted[band_inds_now[:, 0], i2] += sel.astype(int)
                     band_swaps_proposed[band_inds_now[:, 0], i2] += 1
@@ -2893,9 +3088,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         do_synchronize = False
         device = self.xp.cuda.runtime.getDevice()
 
-        # get non-gb contribution
+        # get non-gb contribution. Save the non-GB residual for EVERY split (it is
+        # spread across GPUs); ``check_ll_inject`` restores all of them. Each
+        # ``.copy()`` stays on its array's own device.
         self.remove_cold_chain_sources_from_residual(model, band_sorter, apply_inds=True)
-        self.reset_non_gb_linear_data_arr = model.analysis_container_arr.linear_data_arr[0].copy()
+        self.reset_non_gb_linear_data_arr = [
+            arr.copy() for arr in model.analysis_container_arr.linear_data_arr
+        ]
         self.add_cold_chain_sources_to_residual(model, band_sorter, apply_inds=True)
         ll_after = model.analysis_container_arr.likelihood(
             source_only=False
@@ -2920,11 +3119,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         per_walker_band_proposals = cp.zeros((ntemps, nwalkers, self.num_bands), dtype=int)
         per_walker_band_accepted = cp.zeros((ntemps, nwalkers, self.num_bands), dtype=int)
         
+        num_active_leaves = new_state.branches["gb"].inds[0].sum(axis=-1) # cold chain only
+        logger.info(f"Number of active leaves before proposal: {num_active_leaves}")
         # TODO: make sure band temps transfers out
         st_prop = time.perf_counter()
         ll_change_log = self.run_proposal(model, new_state, band_sorter, band_temps)
         et_prop = time.perf_counter()
         logger.info(f"Runtime of {self.name} proposal is {round(et_prop - st_prop,3)} seconds.")
+        # Diagnostic: per-temperature alive source counts after run_proposal
+        _alive_per_temp_post_prop = [
+            int(band_sorter.inds[band_sorter.temp_inds == _t].sum()) for _t in range(ntemps)
+        ]
+        logger.info(f"Alive sources per temp after run_proposal: {_alive_per_temp_post_prop}")
         
         # TODO ask michael about this print("NEED TO FIX ANALYSIS CONTAINER extra factor")
         ll_change_sum = ll_change_log.sum(axis=-1)
@@ -2977,8 +3183,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self.mempool.free_all_blocks()
             et_temp = time.perf_counter()
             logger.info(f"Runtime of {self.name} tempering is {round(et_temp - st_temp,3)} seconds.")
-            
+            # Diagnostic: per-temperature alive source counts after run_tempering
+            _alive_per_temp_post_temp = [
+                int(band_sorter.inds[band_sorter.temp_inds == _t].sum()) for _t in range(ntemps)
+            ]
+            logger.info(f"Alive sources per temp after run_tempering: {_alive_per_temp_post_temp}")
+
         # TODO ask michael about this print("make sure this works for rj")
+        # Diagnostic: per-temperature alive source counts before write-back
+        _alive_per_temp_pre_wb = [
+            int(band_sorter.inds[band_sorter.temp_inds == _t].sum()) for _t in range(ntemps)
+        ]
+        logger.info(f"Alive sources per temp before write-back: {_alive_per_temp_pre_wb}")
         special_indices_finish = (
             band_sorter.temp_inds[band_sorter.inds] * nwalkers
             + band_sorter.walker_inds[band_sorter.inds]
@@ -3019,6 +3235,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # new_state.branches["gb"].branch_supplemental[inds_new] = state.branches["gb"].branch_supplemental[inds_old]
         et_all = time.perf_counter()
         logger.info(f"Full runtime of {self.name} is {round(et_all - st_all, 3)} seconds.")
+        num_active_leaves = new_state.branches["gb"].inds[0].sum(axis=-1)
+        logger.info(f"Number of active leaves after proposal: {num_active_leaves}")
 
         # TODO: need to redo the acceptance fraction
         # get accepted fraction
@@ -3135,13 +3353,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # new_state.log_prior[:] = model.compute_log_prior_fn(new_state.branches_coords, inds=new_state.branches_inds, supps=new_state.supplemental)
         accepted = np.zeros((ntemps, nwalkers), dtype=bool)
         
+        num_active_sources = new_state.branches["gb"].inds.sum(axis=-1)[0]
+        logger.info(f"Current number of active sources in cold chain is {num_active_sources}")
+        
         return new_state, accepted
 
     def check_ll_inject(self, model, band_sorter, verbose=False):
         # breakpoint()
         init_like = model.analysis_container_arr.likelihood()
-        model.analysis_container_arr.zero_out_data_arr()
-        model.analysis_container_arr.linear_data_arr[0][:] = self.reset_non_gb_linear_data_arr[:]        
+        acs = model.analysis_container_arr
+        acs.zero_out_data_arr()
+        # Restore the saved non-GB residual on every split (each on its own GPU).
+        gpus = acs.gpus if acs.gpus is not None else [None]
+        for s, gpu in enumerate(gpus):
+            with (self.xp.cuda.Device(gpu) if gpu is not None else _nullcontext()):
+                acs.linear_data_arr[s][:] = self.reset_non_gb_linear_data_arr[s][:]
         self.add_cold_chain_sources_to_residual(model, band_sorter, apply_inds=True)
         final_like = model.analysis_container_arr.likelihood()
         return final_like
@@ -3224,10 +3450,11 @@ def para_log_like(
     xp = gb.backend.xp
 
     x_tmp = transform_fn.both_transforms(x, xp=xp)
-    # need to get just f, fdot, fddot, lam, beta
+    # need to get just f, fdot, fddot, alpha, delta
     data_index = xp.full(x.shape[0], walker_max, dtype=xp.int32)
     if fstat:
         x_in = x_tmp[:, xp.array([1, 2, 3, 7, 8])]
+        # breakpoint()
         # TODO: fix for N>256?
         ll = gb.get_fstat_ll(
             x_in,
@@ -3239,7 +3466,7 @@ def para_log_like(
             data_splits=np.array([gb.gpus[0]]),
             phase_marginalize=phase_maximize,
             return_cupy=True,
-            N=512,  # 1024 is too much shared memory I think
+            N=512,  
             **waveform_kwargs,
         )
 
@@ -3261,7 +3488,7 @@ def para_log_like(
             data_splits=np.array([gb.gpus[0]]),
             phase_marginalize=phase_maximize,
             return_cupy=True,
-            # N=256,
+            # N=512,
             **waveform_kwargs,
         )
         # breakpoint()
@@ -3529,15 +3756,16 @@ class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
         return gb_search_func
 
     def setup(self, model, branches):
-        nwalkers: int = 30
-        ntemps: int = 24
-        shutoff_band_iteration: int = 2
-        shutoff_frequency_threshold: float = None # 4e-3 
-        burn_1: int = 100
-        nsteps_1: int = 100
-        snr_threshold: float = 8.0
-        burn_2: int = 500
-        nsteps_2: int = 500
+        assert isinstance(self.search_kwargs, dict)
+        nwalkers: int = self.search_kwargs["nwalkers"]
+        ntemps: int = self.search_kwargs["ntemps"]
+        shutoff_band_iteration: int = self.search_kwargs["shutoff_band_iteration"]
+        shutoff_frequency_threshold: float = self.search_kwargs["shutoff_frequency_threshold"]
+        burn_1: int = self.search_kwargs["burn_1"]
+        nsteps_1: int = self.search_kwargs["nsteps_1"]
+        snr_threshold: float = self.search_kwargs["snr_threshold"]
+        burn_2: int = self.search_kwargs["burn_2"]
+        nsteps_2: int = self.search_kwargs["nsteps_2"]
         
         # FOR FAST TESTING/DEBUGGING
         # import pickle
@@ -3546,18 +3774,18 @@ class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
 
         # rj_dist = ProbDistContainer(
         #     {
-        #         (r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\cos\iota$", r"$\lambda$", r"$\sin\beta$"): full_gmm,
+        #         (r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\cos\iota$", r"$\alpha$", r"$\sin\delta$"): full_gmm,
         #         r"$\phi_0$": uniform_dist(0.0, 2 * np.pi),
         #         r"$\psi$": uniform_dist(0.0, np.pi),
         #     },
         #     use_cupy=True,
         # )
-        # rj_dist.reset_key_order([r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\phi_0$", r"$\cos\iota$", r"$\psi$", r"$\lambda$", r"$\sin\beta$"])
+        # rj_dist.reset_key_order([r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\phi_0$", r"$\cos\iota$", r"$\psi$", r"$\alpha$", r"$\sin\delta$"])
         # return
         
         # run paraensemble MCMC.
         max_logl_walker = np.argmax(model.analysis_container_arr.likelihood()).item()
-        self.gb.d_d = 0.0  # model.analysis_container_arr.inner_product()[max_logl_walker]
+        self.gb.d_d = model.analysis_container_arr.inner_product()[max_logl_walker] # 0.0
         ndim = branches["gb"].ndim
         priors_global = self.priors if not self.backend.uses_cuda else self.gpu_priors            
 
@@ -3605,8 +3833,6 @@ class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
         priors = {
             "gb": ProbDistContainer(priors_in, return_gpu=True, use_cupy=self.backend.uses_cupy)
         }
-        # print(priors["gb"].key_order)
-        
         start_params = priors["gb"].rvs(size=(ngroups, ntemps, nwalkers))
         prior_transform_fn = PriorTransformFn(f0_min * 1e3, f0_max * 1e3, fdot_min, fdot_max)
         prior_transform_fn.transform_from_prior_basis(start_params, self.xp.arange(ngroups))
@@ -3626,7 +3852,7 @@ class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
             model.analysis_container_arr,
             max_logl_walker,
             self.parameter_transforms,
-            False,  # self.phase_maximize,
+            self.phase_maximize, # False, #
             self.waveform_kwargs,
         )
 
@@ -3706,9 +3932,11 @@ class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
             return
 
         start_params_2 = np.tile(samples[-1][groups_running_now, None], (1, ntemps, 1, 1))
-
+        # Maybe not start from maximized values?
         gibbs_sampling_setup_2 = np.ones(8, dtype=bool)
-        gibbs_sampling_setup_2[np.array([3])] = False
+        if ll_args_2[4]: # phase_maximization
+            gibbs_sampling_setup_2[np.array([3])] = False
+            
         prior_transform_fn_2 = PriorTransformFn(
             f0_min[groups_running_now] * 1e3,
             f0_max[groups_running_now] * 1e3,
@@ -3725,7 +3953,7 @@ class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
             para_log_like,
             priors,
             tempering_kwargs=dict(ntemps=ntemps, Tmax=np.inf),
-            args=ll_args,
+            args=ll_args_2,
             kwargs=dict(fstat=False),
             gpu=self.gb.gpus[0],
             periodic=self.periodic,
@@ -3768,7 +3996,7 @@ class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
         # )
 
         samples_2 = samples_2.transpose(1, 0, 2, 3)
-        # np.save("/sps/lisaf/crondeel/packages/junk_folder/samples_test.npy", samples_2)
+        # np.save("/workspace/rrondeel/erebor/testing/highf_gb/search2_samples_check.npy", samples_2)
 
         st = time.perf_counter()
         samples_2_tmp = samples_2.reshape(samples_2.shape[0], -1, samples_2.shape[-1])[
@@ -3776,22 +4004,35 @@ class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
         ]
 
         if self.xp.isnan(samples_2_tmp).any() or self.xp.isinf(samples_2_tmp).any():
-            breakpoint()
-            raise ValueError(
-                f"samples_2_tmp contains NaN or Inf before GMM fitting. "
-                f"NaN count: {self.xp.isnan(samples_2_tmp).sum()}, "
-                f"Inf count: {self.xp.isinf(samples_2_tmp).sum()}"
+            logger.warning(
+                f"samples_2_tmp contains NaN or Inf before GMM fitting. \
+                NaN count: {self.xp.isnan(samples_2_tmp).sum()}. \
+                Inf count: {self.xp.isinf(samples_2_tmp).sum()}. \
+                Skipping search..."
             )
+            return
+            # breakpoint()
+            # raise ValueError(
+            #     f"samples_2_tmp contains NaN or Inf before GMM fitting. "
+            #     f"NaN count: {self.xp.isnan(samples_2_tmp).sum()}, "
+            #     f"Inf count: {self.xp.isinf(samples_2_tmp).sum()}"
+            # )
 
         ranges = samples_2_tmp.max(axis=1) - samples_2_tmp.min(axis=1)  # (n_groups, n_features)
         degenerate = (ranges == 0)
         if degenerate.any():
             bad_groups, bad_feats = self.xp.where(degenerate)
-            breakpoint()
-            raise ValueError(
-                f"Degenerate features (zero range) in groups {bad_groups} "
-                f"for features {bad_feats}. transform_to_gmm_basis will produce NaN."
+            logger.warning(
+                f"Degenerate features (zero range) in groups {bad_groups} \
+                for features {bad_feats}. transform_to_gmm_basis will produce NaN. \
+                Skipping search..."
             )
+            return
+            # breakpoint()
+            # raise ValueError(
+            #     f"Degenerate features (zero range) in groups {bad_groups} "
+            #     f"for features {bad_feats}. transform_to_gmm_basis will produce NaN."
+            # )
         
         full_gmm = vec_fit_gmm_min_bic(
             samples_2_tmp,
@@ -3810,13 +4051,13 @@ class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
 
         rj_dist = ProbDistContainer(
             {
-                (r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\cos\iota$", r"$\lambda$", r"$\sin\beta$"): full_gmm,
+                (r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\cos\iota$", r"$\alpha$", r"$\sin\delta$"): full_gmm,
                 r"$\phi_0$": uniform_dist(0.0, 2 * np.pi),
                 r"$\psi$": uniform_dist(0.0, np.pi),
             },
             use_cupy=True,
         )
-        rj_dist.reset_key_order([r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\phi_0$", r"$\cos\iota$", r"$\psi$", r"$\lambda$", r"$\sin\beta$"])
+        rj_dist.reset_key_order([r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\phi_0$", r"$\cos\iota$", r"$\psi$", r"$\alpha$", r"$\sin\delta$"])
         # if self.ranks_needed == 0:
         #     gmms = [GMMFit(samples_2[i].get().reshape(-1, 8)) for i in range(samples_2.shape[0])[:10]]
         #     gmm_info = gather_gmms(gmms)
@@ -3898,8 +4139,8 @@ class GBSpecialRJRefitMove(GBSpecialBase):
         GBSpecialBase.__init__(self, *args, **kwargs)
 
     def setup(self, model, branches):
-        samples_keep = 5
-        nwalkers = 30
+        samples_keep = self.search_kwargs["refit_start_iteration"]
+        nwalkers = self.search_kwargs["nwalkers"]
         num_compare_samples = 1
         # FOR FAST TESTING/DEBUGGING
         # import pickle
@@ -3908,13 +4149,13 @@ class GBSpecialRJRefitMove(GBSpecialBase):
 
         # rj_dist = ProbDistContainer(
         #     {
-        #         (r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\cos\iota$", r"$\lambda$", r"$\sin\beta$"): full_gmm,
+        #         (r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\cos\iota$", r"$\alpha$", r"$\sin\delta$"): full_gmm,
         #         r"$\phi_0$": uniform_dist(0.0, 2 * np.pi),
         #         r"$\psi$": uniform_dist(0.0, np.pi),
         #     },
         #     use_cupy=True,
         # )
-        # rj_dist.key_order = [r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\phi_0$", r"$\cos\iota$", r"$\psi$", r"$\lambda$", r"$\sin\beta$"]
+        # rj_dist.key_order = [r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\phi_0$", r"$\cos\iota$", r"$\psi$", r"$\alpha$", r"$\sin\delta$"]
         # self.rj_proposal_distribution = {"gb": rj_dist}
         # return
         # run paraensemble MCMC.
@@ -3951,6 +4192,22 @@ class GBSpecialRJRefitMove(GBSpecialBase):
         num_in_groups = np.asarray([len(tmp) for tmp in groups])
         keep = num_in_groups > nwalkers * samples_keep / 2
 
+        logger.info(
+            f"Groups passing sample count filter: {keep.sum()} / {len(keep)}. "
+            f"num_in_groups: {num_in_groups}"
+        )
+        
+        if not keep.any():
+            logger.warning(
+                f"No groups have enough samples (threshold={nwalkers * samples_keep / 2:.0f}). "
+                f"Max samples in any group: {num_in_groups.max()}. "
+                f"Reverting to priors."
+            )
+            self.rj_proposal_distribution = {
+                "gb": self.priors if not self.backend.uses_cuda else self.gpu_priors
+            }
+            return
+
         max_num_source = max([tmp.shape[0] for tmp in groups])
         samples = np.full((len(groups), max_num_source, groups[0].shape[-1]), np.nan)
         for i, group in enumerate(groups):
@@ -3958,13 +4215,24 @@ class GBSpecialRJRefitMove(GBSpecialBase):
 
         samples_fin = samples[keep]
         num_in_groups_fin = num_in_groups[keep]
+
+        if len(num_in_groups_fin) == 0 or num_in_groups_fin.min() == num_in_groups_fin.max():
+            logger.warning(
+                f"Cannot construct step range from num_in_groups_fin={num_in_groups_fin}. "
+                f"Reverting to priors..."
+            )
+            self.rj_proposal_distribution = {
+                "gb": self.priors if not self.backend.uses_cuda else self.gpu_priors
+            }
+            return
+
         cp.cuda.runtime.setDevice(gpu)
         output_info = []
         step = 5
         steps = np.arange(num_in_groups_fin.min(), num_in_groups_fin.max(), step)
         if steps[-1] < num_in_groups_fin.max().item():
             steps = np.concatenate([steps, np.array([num_in_groups_fin.max().item()])])
-        breakpoint()
+
         weights_all = []
         means_all = []
         covs_all = []
@@ -3979,18 +4247,29 @@ class GBSpecialRJRefitMove(GBSpecialBase):
             
             if np.isnan(samples_here).any():
                 nan_groups = np.where(np.isnan(samples_here).any(axis=(1, 2)))[0]
-                raise ValueError(
-                    f"NaN padding leaked into samples_here at start={start}. "
-                    f"Affected groups (local indices): {nan_groups}. "
-                    f"num_in_groups for those groups: {num_in_groups_fin[here][nan_groups]}"
+                logger.warning(
+                    f"NaN padding leaked into samples_here at start={start}. \
+                    Affected groups (local indices): {nan_groups}. \
+                    num_in_groups for those groups: {num_in_groups_fin[here][nan_groups]} \
+                    Skipping Refit..."
                 )
+                return
+                # raise ValueError(
+                #     f"NaN padding leaked into samples_here at start={start}. "
+                #     f"Affected groups (local indices): {nan_groups}. "
+                #     f"num_in_groups for those groups: {num_in_groups_fin[here][nan_groups]}"
+                # )
 
             ranges = samples_here.max(axis=1) - samples_here.min(axis=1)
             if (ranges == 0).any():
                 bad = np.where((ranges == 0))
-                raise ValueError(
-                    f"Degenerate features at start={start}: groups={bad[0]}, features={bad[1]}"
+                logger.warning(
+                    f"Degenerate features at start={start}: groups={bad[0]}, features={bad[1]} \
+                    Skipping Refit..."
                 )
+                # raise ValueError(
+                #     f"Degenerate features at start={start}: groups={bad[0]}, features={bad[1]}"
+                # )
             
             weights, means, covs, invcovs, dets, mins, maxs = vec_fit_gmm_min_bic(
                 cp.asarray(samples_here),
@@ -4008,9 +4287,8 @@ class GBSpecialRJRefitMove(GBSpecialBase):
             dets_all += dets
             mins_all += mins
             maxs_all += maxs
-            print(start, end)
+            # logger.info(start, end)
         
-        breakpoint()
         full_gmm = FullGaussianMixtureModel(
             weights_all,
             means_all,
@@ -4025,13 +4303,13 @@ class GBSpecialRJRefitMove(GBSpecialBase):
         logger.info(f"Runtime GMM Refit: {round(time.perf_counter() - st)}")
         rj_dist = ProbDistContainer(
             {
-                (r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\cos\iota$", r"$\lambda$", r"$\sin\beta$"): full_gmm,
+                (r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\cos\iota$", r"$\alpha$", r"$\sin\delta$"): full_gmm,
                 r"$\phi_0$": uniform_dist(0.0, 2 * np.pi),
                 r"$\psi$": uniform_dist(0.0, np.pi),
             },
             use_cupy=True,
         )
-        rj_dist.key_order = [r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\phi_0$", r"$\cos\iota$", r"$\psi$", r"$\lambda$", r"$\sin\beta$"]
+        rj_dist.key_order = [r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\phi_0$", r"$\cos\iota$", r"$\psi$", r"$\alpha$", r"$\sin\delta$"]
         # if self.ranks_needed == 0:
         #     gmms = [GMMFit(samples_2[i].get().reshape(-1, 8)) for i in range(samples_2.shape[0])[:10]]
         #     gmm_info = gather_gmms(gmms)
@@ -4058,10 +4336,11 @@ def get_param_limits(array): # can be used for debugging of coordinate values
     num_params = array.shape[-1]
     
     if num_params == 8:
-        param_labels = [r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\phi_0$", r"$\cos\iota$", r"$\psi$", r"$\lambda$", r"$\sin\beta$"]
-    if num_params == 9:
-        param_labels = [r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\ddot{f}$", r"$\phi_0$", r"$\cos\iota$", r"$\psi$", r"$\lambda$", r"$\sin\beta$"]
-
+        param_labels = [r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\phi_0$", r"$\cos\iota$", r"$\psi$", r"$\alpha$", r"$\sin\delta$"]
+    elif num_params == 9:
+        param_labels = [r"$\log A$", r"$f_0$", r"$\dot{f}$", r"$\ddot{f}$", r"$\phi_0$", r"$\cos\iota$", r"$\psi$", r"$\alpha$", r"$\sin\delta$"]
+    else:
+        param_labels = num_params * [""]
     for i, param_label in enumerate(param_labels):
         param_values = array[..., i]
         min_array_i = param_values.min()

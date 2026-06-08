@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from .detector import Orbits
     from .domains import DomainBase, FDSettings, STFTSettings
     from .sensitivity import XYZSensitivityBackend
-
+    from .utils.typing import NDArrayLike, ArrayModule
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +130,13 @@ class BaseDomainComputationGroup(LISAToolsParallelModule):
         sensitivity_backend_kwargs = sensitivity_backend.kwargs.copy()
 
         with self.group_device_context():
+            # Check if the sensitivity matrix array lives on the same device
+            # (or CPU equivalent default). Using split_index == 0 ensures
+            # the original instance mapped to device 0 is reused on device 0.
+            # if self.split_index == 0:
+            #     self._orbits = sensitivity_backend.orbits
+            #     self._sensitivity_backend = sensitivity_backend
+            # else:
             self._orbits = sensitivity_backend.orbits.__class__(*sensitivity_backend.orbits.args, **sensitivity_backend.orbits.kwargs)
 
             sensitivity_backend_kwargs["orbits"] = self._orbits
@@ -142,7 +149,7 @@ class BaseDomainComputationGroup(LISAToolsParallelModule):
         return f"BaseDomainComputationGroup with split index {split_index} and TDI type {self.tdi_type}"
 
     @property
-    def xp(self):
+    def xp(self) -> ArrayModule:
         return self.backend.xp
 
     @property
@@ -183,16 +190,16 @@ class BaseDomainComputationGroup(LISAToolsParallelModule):
 
     def compute_d_d_term(self, out: bool = False, **kwargs):
         """
-        Compute (d|d) term for the containers in this split only.
+        Compute the :math:`\\langle d | d\\rangle` term for the containers in this split only.
 
         Args:
             out : bool, optional
-                If True, return the computed (d|d) term. Otherwise, store it in the instance variable `self.d_d`. Default is False.
+                If True, return the computed :math:`\\langle d | d\\rangle` term. Otherwise, store it in the instance variable `self.d_d`. Default is False.
             **kwargs
                 Additional keyword arguments to pass to the `inner_product` method of each AnalysisContainer.
 
         Returns:
-            If `out` is True, returns a double array of shape ``(num_data,)`` containing the (d|d) term for each container in the split. Otherwise, returns None and stores the result in `self.d_d`.
+            If `out` is True, returns a double array of shape ``(num_data,)`` containing the :math:`\\langle d | d\\rangle` term for each container in the split. Otherwise, returns None and stores the result in `self.d_d`.
 
         Notes
         -----
@@ -201,7 +208,7 @@ class BaseDomainComputationGroup(LISAToolsParallelModule):
         """
         if self.split_acs is None:
             raise ValueError(
-                "Split ACs are not set. Cannot compute (d|d) term. "
+                "Split ACs are not set. Cannot compute :math:`\\langle d | d\\rangle` term. "
                 "Provide an AnalysisContainerArray to extract_from_acs first."
             )
 
@@ -213,14 +220,46 @@ class BaseDomainComputationGroup(LISAToolsParallelModule):
         if out:
             return self.d_d.copy()
 
+    def compute_noise_term(self, out: bool = False, **kwargs):
+        """
+        Compute :math:`\\log{\\mathcal{L}}_n = -\\sum \\log{\\vec{S}_n}` term for the containers in this split only.
+
+        Args:
+            out : bool, optional
+                If True, return the computed noise likelihood term. Otherwise, store it in the instance variable `self.noise_term`. Default is False.
+            **kwargs
+                Additional keyword arguments to pass to the `inner_product` method of each AnalysisContainer.
+
+        Returns:
+            If `out` is True, returns a double array of shape ``(num_data,)`` containing the :math:`\\log{\\mathcal{L}}_n` term for each container in the split. Otherwise, returns None and stores the result in `self.noise_term`.
+
+        Notes
+        -----
+        The result ``self.noise_term`` has shape ``(num_data,)`` — one value per
+        container in the split, indexed by intra-split index.
+        """
+        if self.split_acs is None:
+            raise ValueError(
+                "Split ACs are not set. Cannot compute :math:`\\log{\\mathcal{L}}_n` term. "
+                "Provide an AnalysisContainerArray to extract_from_acs first."
+            )
+
+        noise_term = self.xp.zeros(self.num_data, dtype=self.xp.float64)
+        for i, ac in enumerate(self.split_acs):
+            noise_term[i] = ac.likelihood(source_only=False, noise_only=True, **kwargs)
+        self.noise_term = noise_term
+
+        if out:
+            return self.noise_term.copy()
+
     def compute_signal_likelihood_terms(
         self,
-        data_index: np.ndarray | cp.ndarray,
-        noise_index: np.ndarray | cp.ndarray,
-        template_vals: np.ndarray | cp.ndarray,
-        start_freqs: np.ndarray | cp.ndarray,
+        data_index: NDArrayLike,
+        noise_index: NDArrayLike,
+        template_vals: NDArrayLike,
+        start_freqs: NDArrayLike,
         **kwargs,
-    ) -> tuple[np.ndarray | cp.ndarray, np.ndarray | cp.ndarray]:
+    ) -> tuple[NDArrayLike, NDArrayLike]:
         """
         Compute the inner products :math:`\\langle d | h\\rangle` and :math:`\\langle h | h\\rangle` for the input set of binaries.
 
@@ -233,13 +272,13 @@ class BaseDomainComputationGroup(LISAToolsParallelModule):
 
     def compute_signal_likelihood(
         self,
-        data_index: np.ndarray | cp.ndarray,
-        noise_index: np.ndarray | cp.ndarray,
-        template_vals: np.ndarray | cp.ndarray,
-        start_freqs: np.ndarray | cp.ndarray,
-        start_times: np.ndarray | cp.ndarray = None,
+        data_index: NDArrayLike,
+        noise_index: NDArrayLike,
+        template_vals: NDArrayLike,
+        start_freqs: NDArrayLike,
+        start_times: NDArrayLike = None,
         **kwargs,
-    ) -> np.ndarray | cp.ndarray:
+    ) -> NDArrayLike:
         """
         Compute the log-likelihood for a batch of binaries.
 
@@ -275,11 +314,11 @@ class BaseDomainComputationGroup(LISAToolsParallelModule):
 
     def compute_psd_likelihood(
         self,
-        data_index: np.ndarray | cp.ndarray,
-        noise_index: np.ndarray | cp.ndarray,
+        data_index: NDArrayLike,
+        noise_index: NDArrayLike,
         *args,
         **kwargs,
-    ) -> np.ndarray | cp.ndarray:
+    ) -> NDArrayLike:
         """
         Compute the log-likelihood for a batch of binaries using the data stored in this split.
         Refer to the :meth:`compute_log_like` of lisatools.sensitivity.XYZSensitivityBackend.
@@ -349,13 +388,13 @@ class STFTComputationGroup(BaseDomainComputationGroup):
 
     def compute_signal_likelihood_terms(
         self,
-        data_index: np.ndarray | cp.ndarray,
-        noise_index: np.ndarray | cp.ndarray,
-        template_vals: np.ndarray | cp.ndarray,
-        start_freqs: np.ndarray | cp.ndarray,
-        start_times: np.ndarray | cp.ndarray,
+        data_index: NDArrayLike,
+        noise_index: NDArrayLike,
+        template_vals: NDArrayLike,
+        start_freqs: NDArrayLike,
+        start_times: NDArrayLike,
         **kwargs,
-    ) -> tuple[np.ndarray | cp.ndarray, np.ndarray | cp.ndarray]:
+    ) -> tuple[NDArrayLike, NDArrayLike]:
         """
         Compute (d|h) and (h|h) for a batch of binaries.
 
@@ -439,12 +478,12 @@ class FDComputationGroup(BaseDomainComputationGroup):
 
     def compute_signal_likelihood_terms(
         self,
-        data_index: np.ndarray | cp.ndarray,
-        noise_index: np.ndarray | cp.ndarray,
-        template_vals: np.ndarray | cp.ndarray,
-        start_freqs: np.ndarray | cp.ndarray,
+        data_index: NDArrayLike,
+        noise_index: NDArrayLike,
+        template_vals: NDArrayLike,
+        start_freqs: NDArrayLike,
         **kwargs,
-    ) -> tuple[np.ndarray | cp.ndarray, np.ndarray | cp.ndarray]:
+    ) -> tuple[NDArrayLike, NDArrayLike]:
         """
         Compute (d|h) and (h|h) for a batch of binaries.
 
@@ -598,12 +637,12 @@ class DomainComputationGroupArray:
                 yield "cpu"
 
         else:
-            device_id = self.gpus.index(device)
+            # device_id = self.gpus.index(device)
 
             # GPU context - set context to the specified GPU device
-            with jax.default_device(jax.devices("gpu")[device_id]):
-                with self.xp.cuda.Device(device):
-                    yield f"gpu: {device}"
+            # with jax.default_device(jax.devices("gpu")[device_id]):
+            with self.xp.cuda.Device(device):
+                yield f"gpu: {device}"
 
     def restore_main_device(self):
         """Restores the main device context after GPU computations, and calls ``xp.get_default_memory_pool().free_all_blocks()`` to clear GPU memory.
@@ -628,16 +667,26 @@ class DomainComputationGroupArray:
             for device in self.gpus:
                 with self.device_context(device):
                     self.xp.cuda.runtime.deviceSynchronize()
+
+    def free_gpu_memory(self):
+        """Frees GPU memory on all devices by calling ``xp.get_default_memory_pool().free_all_blocks()`` for each device.
+
+        Notes:
+            This method should be called after performing computations on multiple GPU devices to ensure that GPU memory is freed and available for future computations.
+        """
+        if self.gpus is not None:
+            for device in self.gpus:
+                with self.device_context(device):
                     self.xp.get_default_memory_pool().free_all_blocks()
 
-    def _to_host(self, arr: np.ndarray | cp.ndarray) -> np.ndarray:
+    def _to_host(self, arr: NDArrayLike) -> np.ndarray:
         """Move an array to the host, ensuring it is a numpy ndarray."""
         return arr.get() if hasattr(arr, "get") else arr
 
     def unpack_indices(
         self,
-        data_index: np.ndarray | cp.ndarray,
-        noise_index: np.ndarray | cp.ndarray = None,
+        data_index: NDArrayLike,
+        noise_index: NDArrayLike = None,
     ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
         """Partition a flat ``(data_index, noise_index)`` batch by split.
 
@@ -673,7 +722,7 @@ class DomainComputationGroupArray:
     def unpack_coords(
         self,
         positions_per_split: list[np.ndarray],
-        coords: np.ndarray | cp.ndarray | tuple[np.ndarray | cp.ndarray],
+        coords: NDArrayLike | tuple[NDArrayLike],
         keep_tuple: bool = False,
     ) -> list[tuple[np.ndarray] | np.ndarray]:
         """
@@ -706,7 +755,7 @@ class DomainComputationGroupArray:
 
     def place_on_device(
         self, items: tuple[list[np.ndarray | tuple[np.ndarray]]]
-    ) -> tuple[list[np.ndarray | cp.ndarray | tuple[np.ndarray | cp.ndarray]]]:
+    ) -> tuple[list[NDArrayLike | tuple[NDArrayLike]]]:
         """Place lists of arrays on the appropriate devices for each split.
 
         Args:
@@ -726,12 +775,12 @@ class DomainComputationGroupArray:
                 for item_id, item_per_split in enumerate(items):
                     entry = item_per_split[i]
                     if isinstance(entry, np.ndarray):
-                        device_items[item_id].append(self.xp.asarray(entry))
+                        device_items[item_id].append(self.xp.asarray(entry, copy=True))
                     elif isinstance(entry, tuple):
                         if len(entry) == 0:
                             device_items[item_id].append(())
                         else:
-                            device_items[item_id].append(tuple(self.xp.asarray(arr) for arr in entry))
+                            device_items[item_id].append(tuple(self.xp.asarray(arr, copy=True) for arr in entry))
                     else:
                         raise ValueError("Each entry in items must be either a numpy array or a tuple of numpy arrays.")
         return tuple(device_items)
@@ -817,11 +866,22 @@ class DomainComputationGroupArray:
         if out:
             return list_out
 
+    def compute_noise_terms(self, out: bool = False, **kwargs):
+        """Compute noise likelihood terms for all splits and store them in the respective computation groups."""
+
+        operations = [group.compute_noise_term for group in self.computation_groups]
+
+        list_out = self._loop_operation(
+            operation=operations, operation_kwargs={"out": out, **kwargs}
+        )
+        if out:
+            return list_out
+
     def _compute_group_likelihood(
         self,
         positions_per_split: list[np.ndarray],
-        data_intra_per_split: list[np.ndarray | cp.ndarray],
-        noise_intra_per_split: list[np.ndarray | cp.ndarray],
+        data_intra_per_split: list[NDArrayLike],
+        noise_intra_per_split: list[NDArrayLike],
         operations: list[Callable],
         likelihood_args_per_split: list[tuple],
         likelihood_kwargs: dict | list[dict] = None, 
@@ -832,10 +892,11 @@ class DomainComputationGroupArray:
 
         operation_args_per_split = []
         for split_id in range(self.num_splits):
+            likelihood_args = likelihood_args_per_split[split_id]
             args_i = (
                 data_intra_per_split[split_id],
                 noise_intra_per_split[split_id],
-                *likelihood_args_per_split[split_id],
+                *(likelihood_args if likelihood_args is not None else ()),
             )
             operation_args_per_split.append(args_i)
 
@@ -846,19 +907,21 @@ class DomainComputationGroupArray:
         # now synchronize
         self.synchronize()
         n_data = sum(len(p) for p in positions_per_split)
-        output = np.empty(n_data, dtype=np.float64)
+    
+        output = np.full(n_data, -1e300, dtype=np.float64)
         for split_id, positions in enumerate(positions_per_split):
             if len(positions) > 0:
                 output[positions] = self._to_host(all_logls[split_id])
 
-        self.synchronize()
+        if np.any(output == -1e300):
+            logger.warning("Some positions were not filled in the output array. This may indicate an issue with the likelihood computation or aggregation.")
         return output
 
     def compute_psd_likelihood(
         self,
         positions_per_split: list[np.ndarray],
-        data_intra_per_split: list[np.ndarray | cp.ndarray],
-        noise_intra_per_split: list[np.ndarray | cp.ndarray],
+        data_intra_per_split: list[NDArrayLike],
+        noise_intra_per_split: list[NDArrayLike],
         likelihood_args_per_split: list[tuple],
         likelihood_kwargs: dict | list[dict] = None,
         run_threaded: bool = False,
@@ -878,8 +941,8 @@ class DomainComputationGroupArray:
     def compute_signal_likelihood(
         self,
         positions_per_split: list[np.ndarray],
-        data_intra_per_split: list[np.ndarray | cp.ndarray],
-        noise_intra_per_split: list[np.ndarray | cp.ndarray],
+        data_intra_per_split: list[NDArrayLike],
+        noise_intra_per_split: list[NDArrayLike],
         likelihood_args_per_split: list[tuple],
         likelihood_kwargs: dict | list[dict] = None,
         run_threaded: bool = False,

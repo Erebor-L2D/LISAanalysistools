@@ -146,6 +146,7 @@ public:
      * @param N_sky        number of sky pixels
      * @param alpha0       LISA orbit initial phase (rad)
      * @param beta0        LISA orbit inclination (rad)
+     * @param t0           LISA orbit reference time for alpha and beta (s)
      * @param N_times      number of time segments (max)
      * @param N_freqs      number of frequency bins (max)
      */
@@ -154,7 +155,7 @@ public:
         array_type<double> quad_weights, array_type<double> cos_beta_ecl,
         array_type<double> lam_ecl, array_type<double> beta_ecl,
         int N_quad, int N_sky,
-        double alpha0, double beta0,
+        double alpha0, double beta0, double t0,
         int N_times, int N_freqs)
     {
         gal_grid = new GalacticGrid();
@@ -165,7 +166,7 @@ public:
             return_pointer_and_check_length(cos_beta_ecl, "cos_beta_ecl", N_sky,          1),
             return_pointer_and_check_length(lam_ecl,      "lam_ecl",      N_sky,          1),
             return_pointer_and_check_length(beta_ecl,     "beta_ecl",     N_sky,          1),
-            N_quad, N_sky, alpha0, beta0, N_times, N_freqs
+            N_quad, N_sky, alpha0, beta0, t0, N_times, N_freqs
         );
     }
 
@@ -312,6 +313,13 @@ public:
         array_type<double> c00_arr, array_type<std::complex<double>> c01_arr, array_type<std::complex<double>> c02_arr,
         array_type<double> c11_arr, array_type<std::complex<double>> c12_arr, array_type<double> c22_arr,
         int num_freqs, int num_times);
+
+    void set_averaged_tfs_wrap(
+        array_type<double> oms_xx, array_type<std::complex<double>> oms_xy, array_type<std::complex<double>> oms_xz,
+        array_type<double> oms_yy, array_type<std::complex<double>> oms_yz, array_type<double> oms_zz,
+        array_type<double> tm_xx,  array_type<std::complex<double>> tm_xy,  array_type<std::complex<double>> tm_xz,
+        array_type<double> tm_yy,  array_type<std::complex<double>> tm_yz,  array_type<double> tm_zz, int nf);
+    void disable_averaged_tfs_wrap();
 
     void get_inverse_det_wrap(
         array_type<double> c00_arr, array_type<std::complex<double>> c01_arr, array_type<std::complex<double>> c02_arr,

@@ -19,11 +19,18 @@ from typing import TYPE_CHECKING
 from lisatools.detector import L1Orbits
 from lisatools.domaincomputation import DomainComputationGroupArray
 from lisatools.utils.constants import *
+from eryn.state import BranchSupplemental
 from lisatools.globalfit.run import CurrentInfoGlobalFit
 from lisatools.globalfit.stock.erebor import PSDSetup, PSDSettings, MBHSetup, MBHSettings, GBSetup, GBSettings, get_fdot_mojito
 
+
+from eryn.prior import uniform_dist, log_uniform
+from eryn.utils import TransformContainer
 from eryn.prior import ProbDistContainer
 
+from eryn.moves import StretchMove, TemperatureControl
+from eryn.moves.tempering import make_ladder
+from lisatools.globalfit.moves import GFCombineMove, MultiGPUPSDMove, TDMBHSpecialMove
 from lisatools.globalfit.engine import GlobalFitSettings, GeneralSetup, GeneralSettings, RankInfo
 from lisatools.globalfit.recipe_steps import subtract_initial_signal
 from lisatools.utils.constants import YRSID_SI
@@ -34,6 +41,7 @@ from lisatools.globalfit.preprocessing import L1ProcessingStep
 from lisatools.globalfit.recipe_steps import (
     SearchRecipeStep,
     PERecipeStep,
+    RJRecipeStep,
     build_psd_moves,
     build_gb_moves,
     build_mbh_moves_phenom,
@@ -59,11 +67,11 @@ MOJITO_REFERENCE_TIME = 97729089.327664
 logger = logging.getLogger(__name__)
 
 
-#####################
+################
 
-### DEFINE RECIPE ###
+### DEFINE RECIPE
 
-#####################
+#############
 
 
 def setup_recipe(
@@ -85,8 +93,7 @@ def setup_recipe(
     # iteratively_resolved_population = np.load("iteratively_resolved_gbs_075yrs_snr7.npy")
     # subset_inds = np.array([int(name.split('_')[1]) for name in iteratively_resolved_population["Name"]])
     subset_inds = None
-    setup_state_for_injection(curr, state, "VGB", "gb", spread=spread_gb, subset_inds=subset_inds)
-
+    # setup_state_for_injection(curr, state, "GB", "gb", spread=spread_gb, subset_inds=subset_inds)
     
     #* ================================= BUILD MOVES ==================================
     gb_search_moves, gb_pe_moves = build_gb_moves(
@@ -94,18 +101,16 @@ def setup_recipe(
     )
 
     #* ================================= SETUP SEARCH ================================= 
-    # search_weights = [0.8, 0.15, 0.05]
-    # recipe.add_recipe_component(RJRecipeStep(moves=gb_search_moves, weights=search_weights, convergence_iter=10), name="gb search")
+    search_weights = [0.8, 0.2]
+    recipe.add_recipe_component(RJRecipeStep(moves=gb_search_moves, weights=search_weights, convergence_iter=10), name="gb search")
     
     #* ========================== SETUP PARAMETER ESTIMATION ========================== 
     all_pe_moves = gb_pe_moves 
-    pe_weights = [0.8, 0.19, 0.01] # [0.05, 0.45, 0.5] # 
+    pe_weights = [0.8, 0.16, 0.04] # [0.05, 0.45, 0.5] # 
     recipe.add_recipe_component(PERecipeStep(moves=all_pe_moves, weights=pe_weights, thin_by=1, convergence_iter=500), name="gb_pe")
     
-    moves_info = "".join([f"Move {all_pe_moves[i].name} has weight {w}, " for i, w in enumerate(pe_weights)])
-    logger.info(f"For PE: {moves_info}")
-
-    
+    # moves_info = "".join([f"Move {all_pe_moves[i].name} has weight {w}, " for i, w in enumerate(pe_weights)])
+    # logger.info(f"For PE: {moves_info}")
 
 
 #######################
@@ -121,7 +126,7 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
     delta_safe = 1e-9
 
     A_lims = [10**(-23.2), 1e-20]
-    f0_lims = [1e-4, 0.01] # reset by band limits
+    f0_lims = [1e-4, 0.023] # reset by band limits
     
     m_chirp_lims = [0.03, 1.34]
     # fdot_max_val = get_fdot(f0_lims[-1], Mc=m_chirp_lims[-1])
@@ -134,17 +139,17 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
     delta_lims = [-np.pi / 2.0 + delta_safe, np.pi / 2.0 - delta_safe]
     
     input_data_arr: DataResidualArray = general_set.input_data_residual_array
-    start_freq = float(input_data_arr.settings.f_arr[0])
-    end_freq = float(input_data_arr.settings.f_arr[-1])
+    start_freq = float(input_data_arr.settings.f_arr.min())
+    end_freq = float(input_data_arr.settings.f_arr.max())
     
     Tobs = 1/getattr(input_data_arr.settings, "df")
 
     oversample = 4
     extra_buffer = 5
     
-    assert start_freq and end_freq and general_set.Tobs and general_set.preprocess_kwargs
-    start_freq_ind = int(np.round(start_freq * general_set.Tobs))
-    
+    assert start_freq and end_freq and general_set.preprocess_kwargs
+    start_freq_ind = int(np.round(start_freq * Tobs))
+
     initialize_kwargs = dict(
         orbits=general_set.gpu_orbits if gpu_available else general_set.orbits, 
         t0=general_set.data_t0,
@@ -155,19 +160,20 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
     betas = 1 / 1.2 ** np.arange(general_set.ntemps)
     betas[-1] = 0.0001
 
+
     search_kwargs = dict(
         nwalkers = 32,
         ntemps = 24,
-        shutoff_band_iteration = 20,
+        shutoff_band_iteration = 2,
         shutoff_frequency_threshold = None, # 4e-3 
-        burn_1 = 800,
-        nsteps_1 = 200,
+        burn_1 = 700,
+        nsteps_1 = 300,
         snr_threshold = 8.0,
         burn_2 = 500,
         nsteps_2 = 500,
         refit_start_iteration = 5
     )
-    
+
     waveform_kwargs = dict(
         dt=general_set.dt,
         T=Tobs,
@@ -204,13 +210,13 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
         initialize_kwargs=initialize_kwargs,
         waveform_kwargs=waveform_kwargs,
         # Transform, Priors, Periodic (handled later!)
-        nleaves_max=100,
+        nleaves_max=20,
         nleaves_min=0,
         ndim=8,
         betas=betas,
         log_dir=general_set.file_store_dir,
-        num_repeat_proposals=50, 
-        search_kwargs=search_kwargs        
+        num_repeat_proposals=100,
+        search_kwargs=search_kwargs
     )
 
     gb_setup = GBSetup(gb_settings)
@@ -239,34 +245,25 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
 def get_general_erebor_settings() -> GeneralSetup:
 
     global_fit_codename = "erebor"
-    global_fit_version = "CDL1run1_v2"
+    global_fit_version = "TEST_highf_gb_v2"
     global_fit_contact = "ereborl2d@googlegroups.com"
     global_fit_code_link = "https://github.com/Erebor-L2D"
     global_fit_input_data_link = ""
     global_fit_input_reference = "mojito light"
     global_fit_noise_model = "parametric"
     global_fit_noise_model_code_link = "https://github.com/Erebor-L2D" #todo populate repositories
-    comment = "making a shorter run to have something for tomorrow"
-
-    submission_folder = None # "/workspace/rrondeel/erebor/vgb_run_2/"
-
-    # source_ids = [18, 5, 16]
+    comment = "Testing equatorial coordinates to obtain results on 2nd highest GB. Now with correct t0"
 
     Tobs = 9.0 * YRSID_SI / 12.0
     dt = 5.0
-    start_freq = 1e-4
-    end_freq = 1.1e-2
+    start_freq, end_freq = [0.0193, 0.0200433]
 
-    # head_dir = "/workspace/rrondeel/erebor/"
-    # data_input_path = "/workspace/ggfitlisa/ldc/mojito_light/"
-    # base_file_name = global_fit_version #"test_mbh_18_with_covariance"
-    # file_store_dir = head_dir + "vgb_run_2/"
-    head_dir = "/data/asantini/packages/LISAanalysistools/"
-    data_input_path = "/data/asantini/globalfit/MOJITO_DATA/mojito_light_2p5s/"
-    base_file_name = "dev_vgb"
-    file_store_dir = head_dir + "mojito_output/"
-
-
+    head_dir = "/workspace/rrondeel/erebor/"
+    data_input_path = "/workspace/ggfitlisa/ldc/mojito_light/"
+    base_file_name = global_fit_version #"test_mbh_18_with_covariance"
+    file_store_dir = head_dir + "testing/highf_gb/"
+    submission_folder = file_store_dir
+    
     gpus = [0]
     cp.cuda.runtime.setDevice(gpus[0])
     # Restrict JAX to only see the target GPU — must be set before JAX backend init
@@ -275,8 +272,8 @@ def get_general_erebor_settings() -> GeneralSetup:
     jax.config.update("jax_cuda_visible_devices", ",".join(str(gpu) for gpu in gpus))
 
     backend = "cuda12x" if gpus is not None else "cpu"
-    nwalkers = 30
-    ntemps = 10
+    nwalkers = 32
+    ntemps = 24
 
     window_type = "tukey"
     window_taper_duration = 1 / start_freq
@@ -289,7 +286,7 @@ def get_general_erebor_settings() -> GeneralSetup:
 
     processor_init_kwargs = dict(
         L1_folder=data_input_path,
-        source_types=["vgb", "noise"],  #'vgb', 'gb', "mbhb",
+        source_types=["gb", "noise"],  #'vgb', 'gb', "mbhb",
         source_ids=dict(), # mbhb=source_ids
         verbose=True,
         do_plots=True,
@@ -342,7 +339,7 @@ def get_general_erebor_settings() -> GeneralSetup:
         end_freq=end_freq,
         basis_domain=basis_domain,
         stft_dt=stft_dt,
-        random_seed=103209,
+        random_seed=5701424,
         backup_iter=5,
         nwalkers=nwalkers,
         ntemps=ntemps,
