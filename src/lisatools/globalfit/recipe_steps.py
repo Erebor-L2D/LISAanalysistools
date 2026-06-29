@@ -357,7 +357,7 @@ def gb_catalogue_to_sampling_basis(catalogue_entry: dict, trim_duration: float =
     f_init, phi_init, _ = evolve_galactic_binary(t_ref, t_init, f_ref, phi_ref, fdot, phase_sign=-1)
     
     f0_mHz = f_init * 1e3
-    cos_iota = np.cos(np.array(catalogue_entry["InclinationAngle"]))# % (np.pi)
+    cos_iota = np.cos(np.array(catalogue_entry["InclinationAngle"]))
 
     ra = np.array(catalogue_entry["RightAscension"]) # alpha
     dec = np.array(catalogue_entry["Declination"]) # delta
@@ -452,8 +452,18 @@ def subtract_initial_signal(
                 #     # acs.xp.get_default_memory_pool().free_all_blocks()
                 #     cp.cuda.runtime.setDevice(main_device)  # Switch back to main device after subtraction
                 #     logger.debug(f"Switched back to main CUDA device {main_device} after subtraction.")
-                    
+        # log memory usage after subtraction
+        if acs.gpus is not None:
+            mempool = acs.xp.get_default_memory_pool()
+            used_mem = mempool.used_bytes() / 1e9
+        del signals_in
+        if acs.gpus is not None:          
+            mempool.free_all_blocks()  # Free GPU memory used for signals
+            freed_mem = used_mem - mempool.used_bytes() / 1e9
+            logger.debug(f"GPU memory freed after subtraction: {freed_mem:.2f} GB")
+
         logger.debug(f"Subtracted {counter} initial signals for {source_name}")
+
     else:
         logger.info(f"No initial signals for {source_name}")
 
@@ -716,7 +726,7 @@ def build_gb_moves(
 
         N_vals = band_N_vals[band_inds]
 
-        logger.info("Removing GBs from residuals")
+        logger.info(f"Removing {state.branches["gb"].inds[0].sum()} GBs from residuals, for {nwalkers=}")
         template_in = deepcopy(acs.linear_data_arr)
         # acs lays walkers out in contiguous blocks of ``len(gpu_splits[0])`` per
         # GPU, so ``walker % num_per_gpu_walker`` recovers the intra-split residual
@@ -738,10 +748,12 @@ def build_gb_moves(
             **gb_info.waveform_kwargs,
         )
         max_diff_templates = cp.abs(template_in[0]-acs.linear_data_arr[0]).max()
+        logger.debug(f"Max absolute value in template before subtraction: {cp.abs(template_in[0]).max():5e}")
+        logger.debug(f"Max absolute value in template after subtraction: {cp.abs(acs.linear_data_arr[0]).max():5e}")       
+        acs[0].data_res_arr.data_res_arr.plot(channel=0, filename=curr.general_info.artifacts_file_dir + "data_post_subtraction.png")
         del template_in
         logger.debug(f"The difference in residuals in/out = {max_diff_templates:5e}")
 
-    acs[0].data_res_arr.data_res_arr.plot(channel=0, filename=curr.general_info.artifacts_file_dir + "data_post_subtraction.png")
 
     #* Check if we need to adjust the band temps, and adjust if required
     adjust_temps = False
@@ -799,7 +811,8 @@ def build_gb_moves(
         temperature_control=temperature_control,
         use_gpu=True, 
         num_repeat_proposals=gb_info.num_repeat_proposals,
-        search_kwargs=gb_info.search_kwargs
+        search_kwargs=gb_info.search_kwargs,
+        num_band_preload=10000
     )
 
     #* ============================================= SEARCH MOVES =============================================
